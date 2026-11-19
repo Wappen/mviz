@@ -6,7 +6,7 @@
 //!   right-click   pause / resume (or Space)
 //!   scroll        volume
 //!   left-drag     move the window
-//!   double-click  fullscreen on/off
+//!   double-click  fullscreen on/off (or F11)
 //!   bottom edge   waveform timeline (click or drag to seek)
 //!   Esc           quit
 
@@ -219,6 +219,7 @@ impl ApplicationHandler for App {
                     match event.logical_key {
                         Key::Named(NamedKey::Escape) => event_loop.exit(),
                         Key::Named(NamedKey::Space) => self.playing.player.toggle_pause(),
+                        Key::Named(NamedKey::F11) => ui::toggle_fullscreen(gfx.window()),
                         _ => {}
                     }
                 }

@@ -3,7 +3,7 @@
 //!   wheel               volume
 //!   left-drag           move the window (from fullscreen: leaves
 //!                       fullscreen, then moves the window)
-//!   double left-click   fullscreen on/off (and bring to front)
+//!   double left-click   fullscreen on/off (and bring to front), or F11
 //!   waveform timeline   at the bottom while the cursor is visible over the
 //!                       window (click or drag on it to seek)
 
@@ -109,9 +109,7 @@ impl Ui {
                     self.drag = Drag::Seek;
                     player.scrub(Self::time_at(x, w, player.duration()));
                 } else if now - self.last_click.0 < DOUBLE_CLICK && (x - self.last_click.1).hypot(y - self.last_click.2) < 6.0 {
-                    let full = window.fullscreen().is_some();
-                    window.set_fullscreen(if full { None } else { Some(Fullscreen::Borderless(None)) });
-                    window.focus_window();
+                    toggle_fullscreen(window);
                     self.last_click.0 = f64::NEG_INFINITY;
                     self.drag = Drag::None;
                 } else {
@@ -253,6 +251,13 @@ impl Ui {
             ui.rect(w - PAD - 100.0, PAD + 20.0, 100.0 * v, 2.0, white(0.85 * va));
         }
     }
+}
+
+/// Fullscreen on/off, and bring the window to the front.
+pub fn toggle_fullscreen(window: &Window) {
+    let full = window.fullscreen().is_some();
+    window.set_fullscreen(if full { None } else { Some(Fullscreen::Borderless(None)) });
+    window.focus_window();
 }
 
 fn fmt_time(secs: f64) -> String {

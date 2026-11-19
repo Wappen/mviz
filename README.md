@@ -57,7 +57,7 @@ The song starts at once (about 40 ms after launch) and loops without a gap.
 | Right-click or Space | Pause / resume |
 | Scroll | Volume (remembered between runs) |
 | Left-drag | Move the window (from fullscreen: back to a window, then move) |
-| Double-click | Fullscreen on / off |
+| Double-click or F11 | Fullscreen on / off |
 | Timeline at the bottom | Shown while the cursor is visible; click or drag to seek |
 | Esc | Quit |
 
