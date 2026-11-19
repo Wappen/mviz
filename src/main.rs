@@ -8,10 +8,12 @@
 //!   left-drag     move the window
 //!   double-click  fullscreen on/off (or F11)
 //!   bottom edge   waveform timeline (click or drag to seek)
+//!   drop a file   play that file instead
 //!   Esc           quit
 
 mod analysis;
 mod audio;
+mod dnd;
 mod dsp;
 mod gfx;
 mod modes;
@@ -72,6 +74,52 @@ struct Playing {
     stereo: Stereo,
     ui: ui::Ui,
     dim: f32,
+    /// A dropped file being opened (its loader, and its name); the current
+    /// song keeps playing until it is ready.
+    next: Option<(mpsc::Receiver<Loaded>, String)>,
+}
+
+impl Playing {
+    /// Starts opening `path`; it replaces the current song once it can play.
+    fn open(&mut self, path: PathBuf) {
+        let (tx, rx) = mpsc::channel();
+        self.next = Some((rx, song_name(&path)));
+        std::thread::spawn(move || load(path, tx));
+    }
+
+    /// Switches to the dropped file when it is ready to play.
+    fn poll_next(&mut self, window: &Window) {
+        let Some((rx, _)) = &self.next else { return };
+        let ready = match rx.try_recv() {
+            Err(mpsc::TryRecvError::Empty) => return,
+            Ok(Loaded::Ready(track, config, format, info)) => {
+                audio::Player::start(track, config, format, self.player.volume()).map(|p| (p, info))
+            }
+            Ok(Loaded::Failed(e)) => Err(e),
+            _ => Err("could not load the file".into()),
+        };
+        let (rx, name) = self.next.take().expect("checked above");
+        match ready {
+            Ok((player, info)) => {
+                // The old player (and its audio stream) is dropped here.
+                self.player = player;
+                self.rx = rx;
+                self.tl = None;
+                // Fresh analysis state; the afterglow on screen fades over.
+                self.stereo = Stereo::new(self.player.rate);
+                self.mpris.set_track(&info, &name, self.player.duration());
+                self.told = Told { playing: true, volume: self.player.volume(), position: 0.0, at: self.told.at };
+                window.set_title(&format!("{name} — mviz"));
+                self.ui.title = name;
+            }
+            Err(e) => eprintln!("mviz: {name}: {e}"),
+        }
+    }
+}
+
+/// The name shown for a song: its file name without the extension.
+fn song_name(path: &std::path::Path) -> String {
+    path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
 /// The state last reported to the media controls.
@@ -86,6 +134,8 @@ struct Told {
 struct App {
     playing: Playing,
     gfx: Option<Gfx>,
+    /// Files dropped onto the window (Wayland; X11 drops come as events).
+    drops: Option<mpsc::Receiver<PathBuf>>,
     start: Instant,
     last_frame: Instant,
 }
@@ -104,6 +154,10 @@ impl App {
         let mut scene = Scene { clear: modes::base(), ..Default::default() };
 
         let p = &mut self.playing;
+        if let Some(path) = self.drops.as_ref().and_then(|d| d.try_iter().last()) {
+            p.open(path);
+        }
+        p.poll_next(gfx.window());
         match p.rx.try_recv() {
             Ok(Loaded::Analysed(tl)) => {
                 p.tl = Some(tl);
@@ -202,6 +256,7 @@ impl ApplicationHandler for App {
         let attrs = winit::platform::wayland::WindowAttributesExtWayland::with_name(attrs, "mviz", "mviz");
         let attrs = winit::platform::x11::WindowAttributesExtX11::with_name(attrs, "mviz", "mviz");
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
+        self.drops = dnd::listen(&window);
         self.gfx = Some(Gfx::new(window, event_loop.owned_display_handle()));
     }
 
@@ -214,6 +269,7 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(s) => gfx.resize(s.width, s.height),
             WindowEvent::RedrawRequested => self.frame(event_loop),
+            WindowEvent::DroppedFile(path) => self.playing.open(path),
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed && !event.repeat {
                     match event.logical_key {
@@ -270,7 +326,7 @@ fn main() {
     // else (the window, the GPU): sound comes first. Decoding and analysis
     // continue in the background.
     let (tx, rx) = mpsc::channel();
-    let name = path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = song_name(&path);
     std::thread::spawn(move || load(path, tx));
     let started = match rx.recv() {
         Ok(Loaded::Ready(track, config, format, info)) => {
@@ -290,7 +346,7 @@ fn main() {
     event_loop.set_control_flow(ControlFlow::Poll);
     let now = Instant::now();
     let ui = ui::Ui::new(0.0, name.clone());
-    let playing = Playing { stereo: Stereo::new(player.rate), player, mpris, told, tl: None, rx, ui, dim: 0.0 };
-    let mut app = App { playing, gfx: None, start: now, last_frame: now };
+    let playing = Playing { stereo: Stereo::new(player.rate), player, mpris, told, tl: None, rx, ui, dim: 0.0, next: None };
+    let mut app = App { playing, gfx: None, drops: None, start: now, last_frame: now };
     event_loop.run_app(&mut app).expect("run");
 }

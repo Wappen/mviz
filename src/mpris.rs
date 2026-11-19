@@ -39,12 +39,33 @@ pub enum Update {
     Volume(f32),
     /// Song length (s), once known exactly.
     Length(f64),
+    /// A different song is playing.
+    Track(Metadata),
 }
 
 pub struct Mpris {
     updates: async_channel::Sender<Update>,
     pub commands: mpsc::Receiver<Command>,
     cover: Option<PathBuf>,
+    /// Songs played after the first (numbers the cover files).
+    songs: u32,
+}
+
+fn metadata(info: &TrackInfo, name: &str, length: f64, cover: Option<&PathBuf>) -> Metadata {
+    let mut meta = Metadata::builder()
+        .trackid(TrackId::try_from("/org/mviz/Track").unwrap_or(TrackId::NO_TRACK))
+        .title(info.title.clone().unwrap_or_else(|| name.to_string()))
+        .length(micros(length));
+    if let Some(a) = &info.artist {
+        meta = meta.artist([a.clone()]);
+    }
+    if let Some(a) = &info.album {
+        meta = meta.album(a.clone());
+    }
+    if let Some(p) = cover {
+        meta = meta.art_url(format!("file://{}", p.display()));
+    }
+    meta.build()
 }
 
 fn micros(secs: f64) -> Time {
@@ -56,22 +77,8 @@ impl Mpris {
     pub fn start(info: &TrackInfo, name: &str, length: f64, volume: f32) -> Mpris {
         let (updates, update_rx) = async_channel::unbounded::<Update>();
         let (cmd_tx, commands) = mpsc::channel();
-        let cover = info.cover.as_ref().and_then(|(mime, data)| write_cover(mime, data));
-
-        let mut meta = Metadata::builder()
-            .trackid(TrackId::try_from("/org/mviz/Track").unwrap_or(TrackId::NO_TRACK))
-            .title(info.title.clone().unwrap_or_else(|| name.to_string()))
-            .length(micros(length));
-        if let Some(a) = &info.artist {
-            meta = meta.artist([a.clone()]);
-        }
-        if let Some(a) = &info.album {
-            meta = meta.album(a.clone());
-        }
-        if let Some(p) = &cover {
-            meta = meta.art_url(format!("file://{}", p.display()));
-        }
-        let meta = meta.build();
+        let cover = info.cover.as_ref().and_then(|(mime, data)| write_cover(mime, data, 0));
+        let meta = metadata(info, name, length, cover.as_ref());
 
         std::thread::Builder::new()
             .name("mpris".into())
@@ -154,12 +161,27 @@ impl Mpris {
                                 m.set_length(Some(micros(s)));
                                 player.set_metadata(m).await
                             }
+                            Update::Track(m) => {
+                                player.set_position(micros(0.0));
+                                player.set_metadata(m).await
+                            }
                         };
                     }
                 });
             })
             .ok();
-        Mpris { updates, commands, cover }
+        Mpris { updates, commands, cover, songs: 0 }
+    }
+
+    /// Tells the system that a different song is playing now.
+    pub fn set_track(&mut self, info: &TrackInfo, name: &str, length: f64) {
+        if let Some(p) = self.cover.take() {
+            let _ = std::fs::remove_file(p);
+        }
+        // A new file name per song, so clients don't show a cached old cover.
+        self.songs += 1;
+        self.cover = info.cover.as_ref().and_then(|(mime, data)| write_cover(mime, data, self.songs));
+        self.send(Update::Track(metadata(info, name, length, self.cover.as_ref())));
     }
 
     pub fn send(&self, update: Update) {
@@ -176,7 +198,7 @@ impl Drop for Mpris {
 }
 
 /// MPRIS refers to cover art by file URL: write it to the cache directory.
-fn write_cover(mime: &str, data: &[u8]) -> Option<PathBuf> {
+fn write_cover(mime: &str, data: &[u8], song: u32) -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
@@ -189,7 +211,7 @@ fn write_cover(mime: &str, data: &[u8]) -> Option<PathBuf> {
     };
     let dir = base.join("mviz");
     std::fs::create_dir_all(&dir).ok()?;
-    let path = dir.join(format!("cover-{}.{ext}", std::process::id()));
+    let path = dir.join(format!("cover-{}-{song}.{ext}", std::process::id()));
     std::fs::write(&path, data).ok()?;
     Some(path)
 }

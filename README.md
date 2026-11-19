@@ -59,6 +59,7 @@ The song starts at once (about 40 ms after launch) and loops without a gap.
 | Left-drag | Move the window (from fullscreen: back to a window, then move) |
 | Double-click or F11 | Fullscreen on / off |
 | Timeline at the bottom | Shown while the cursor is visible; click or drag to seek |
+| Drop a file on the window | Play that file instead |
 | Esc | Quit |
 
 mviz also appears in the desktop's **media controls** (MPRIS): the Plasma media
