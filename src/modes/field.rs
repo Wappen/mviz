@@ -84,18 +84,17 @@ pub fn draw(st: &Stereo, out: &mut Batch, w: f32, h: f32) {
         // Keep total light per area steady where neighbouring bands' glows overlap.
         let (_, band_ry) = spot_size(&p, band.fc, w, h);
         let density = (p.density * dy(b) * h / band_ry).min(1.0);
-        // Noise has no pitch, so no pitch colour.
-        let saturation = if p.noise_white > 0.0 {
-            p.saturation * (1.0 - p.noise_white * (1.0 - tonality(st, band)))
-        } else {
-            p.saturation
-        };
+        // Noise has no pitch, so no pitch colour, and less light: it would
+        // wash out the pitched light it overlaps.
+        let tone = if p.noise_white > 0.0 || p.noise_dim > 0.0 { tonality(st, band) } else { 1.0 };
+        let saturation = p.saturation * (1.0 - p.noise_white * (1.0 - tone));
+        let noise_light = 1.0 - p.noise_dim * (1.0 - tone);
         for part in &band.parts {
             let [sl, sr] = &st.spec[part.res];
             let hz = st.bin_hz[part.res];
             for k in part.k0.max(1)..part.k1.min(sl.len()) {
                 let share = part.weight * (sl[k].norm_sqr() + sr[k].norm_sqr()) / g.energy;
-                let mut light = g.bright * share * density * p.exposure;
+                let mut light = g.bright * share * density * p.exposure * noise_light;
                 if light < 1e-3 {
                     continue;
                 }
@@ -130,18 +129,14 @@ pub fn draw(st: &Stereo, out: &mut Batch, w: f32, h: f32) {
     }
 }
 
-/// How far (dB) a band's strongest bin must stand out above its neighbours
-/// to count as a pitch: up to `PEAK_NOISE_DB` is noise, from `PEAK_TONE_DB`
-/// a clear tone.
-const PEAK_NOISE_DB: f32 = 4.0;
-const PEAK_TONE_DB: f32 = 12.0;
-
 /// How pitched a band sounds, 0 (noise) to 1 (clear tone), from the
 /// smoothed spectrum: a tone is a narrow peak with deep valleys right next
 /// to it on both sides; noise has none. Comparing with the higher valley
 /// keeps a steep edge (like an MP3's cutoff at 16 kHz) from looking like a
-/// tone.
+/// tone. How far the peak must stand out: `tone_lo_db` (noise) to
+/// `tone_hi_db` (a clear tone).
 pub(super) fn tonality(st: &Stereo, band: &super::stereo::Band) -> f32 {
+    let p = params::get();
     let Some(part) = band.parts.iter().max_by(|a, b| a.weight.total_cmp(&b.weight)) else { return 1.0 };
     let bins = &st.bins[part.res];
     let hz = st.bin_hz[part.res];
@@ -166,7 +161,7 @@ pub(super) fn tonality(st: &Stereo, band: &super::stereo::Band) -> f32 {
     let right = side(peak + 2..=peak + 5);
     let Some(around) = left.into_iter().chain(right).reduce(f32::max) else { return 1.0 };
     let db = 10.0 * ((power(peak) + 1e-20) / (around + 1e-20)).log10();
-    ((db - PEAK_NOISE_DB) / (PEAK_TONE_DB - PEAK_NOISE_DB)).clamp(0.0, 1.0)
+    ((db - p.tone_lo_db) / (p.tone_hi_db - p.tone_lo_db).max(1e-3)).clamp(0.0, 1.0)
 }
 
 /// The dominant direction of a covariance: its principal eigenvector.

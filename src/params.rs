@@ -61,6 +61,14 @@ pub struct Params {
     /// Sounds without a clear pitch (noise, cymbals, breath) lose this much
     /// of their colour (0 = all coloured, 1 = noise fully white).
     pub noise_white: f32,
+    /// How far (dB) a band's strongest peak must stand out above its
+    /// surroundings: up to `tone_lo_db` it is noise, from `tone_hi_db` a
+    /// clear tone (in between, partly pitched).
+    pub tone_lo_db: f32,
+    pub tone_hi_db: f32,
+    /// Unpitched light is dimmed by this much (0 = not at all), so noise
+    /// does not wash out the pitched light it overlaps.
+    pub noise_dim: f32,
     /// Bright light rolls off softly above this level.
     pub knee: f32,
 
@@ -130,6 +138,9 @@ impl Params {
         phon: 100.0,
         felt_bass: 0.0,
         noise_white: 1.0,
+        tone_lo_db: 3.0,
+        tone_hi_db: 8.0,
+        noise_dim: 0.5,
         knee: 0.8,
         fade: 0.25,
         fade_blur: 1.2,

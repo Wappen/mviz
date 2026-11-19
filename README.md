@@ -26,7 +26,7 @@ You are sitting in front of the speakers:
 - **Colour** is the note: every C has the same hue, every C♯ the next one, and
   so on. Every colour emits the same amount of light, so brightness shows
   loudness, not the note. Sounds without a pitch (cymbals, hi-hats, breath,
-  noise) are white.
+  noise) are white and dimmer, so they don't wash out the notes around them.
 - **Brightness** follows perceived loudness: what the ear hears (the ISO 226
   equal-loudness curves) plus deep bass felt in the body.
 - **Size and softness** grow with depth. The deepest bass spreads into a wide,
