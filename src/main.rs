@@ -318,7 +318,7 @@ fn main() {
         }
         return;
     }
-    let Some(path) = std::env::args_os().nth(1).map(PathBuf::from) else {
+    let Some(path) = args.first().map(PathBuf::from) else {
         eprintln!("usage: mviz <audio file>");
         std::process::exit(2);
     };

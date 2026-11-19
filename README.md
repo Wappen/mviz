@@ -24,7 +24,11 @@ You are sitting in front of the speakers:
 - **Bottom ↔ top** is pitch, on a musical (logarithmic) scale: every octave gets
   the same height.
 - **Colour** is the note: every C has the same hue, every C♯ the next one, and
-  so on.
+  so on. Every colour emits the same amount of light, so brightness shows
+  loudness, not the note. Sounds without a pitch (cymbals, hi-hats, breath,
+  noise) are white.
+- **Brightness** follows perceived loudness: what the ear hears (the ISO 226
+  equal-loudness curves) plus deep bass felt in the body.
 - **Size and softness** grow with depth. The deepest bass spreads into a wide,
   flat **carpet** along the bottom, and the highs are small, round sparks.
 - **Direct sounds are crisp; diffuse ones (reverb, wide pads) are larger and
@@ -33,7 +37,9 @@ You are sitting in front of the speakers:
 - **Afterglow:** light fades like a phosphor screen: fast at first, then slowly.
   Moving sounds leave trails, and overlapping light adds up like light.
 - **Background:** the bass (below about 80 Hz) lights the background, each side
-  with its own channel, tinted by the bass note.
+  with its own channel, tinted by the bass note (paler when the bass has no
+  clear pitch). Colour changes crossfade, and the glow fades out like the
+  rest.
 
 The light is computed live from the audio: each frame analyses the music at the
 playback position with FFTs at three resolutions (long windows for the bass,

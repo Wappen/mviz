@@ -283,9 +283,23 @@ impl Stereo {
             self.background = (self.background + dt.min(0.1) / 0.6).min(1.0);
         }
         let mut live = Batch::default();
-        draw_background(background, &mut live, tl, (frame / rate as f64) as f32, self.background, w, h);
+        let tonality = if params::get().bg_noise_white > 0.0 { self.bass_tonality() } else { 1.0 };
+        draw_background(background, &mut live, tl, (frame / rate as f64) as f32, tonality, self.background, w, h);
         super::field::draw(self, &mut live, w, h);
         PhosphorFrame { live, advance }
+    }
+}
+
+impl Stereo {
+    /// How pitched the deep bass (the background's range, up to 100 Hz) is
+    /// right now: the bands' tonality weighted by their energy.
+    fn bass_tonality(&self) -> f32 {
+        let (mut sum, mut weight) = (0.0, 0.0);
+        for (g, band) in self.live.iter().zip(&self.bands).filter(|(_, b)| b.fc <= 100.0) {
+            sum += super::field::tonality(self, band) * g.energy;
+            weight += g.energy;
+        }
+        if weight > 1e-12 { sum / weight } else { 1.0 }
     }
 }
 
@@ -295,8 +309,9 @@ fn brightness(p: &params::Params, e: f32, fc: f32, reference: f32) -> f32 {
     if e < 1e-12 {
         return 0.0;
     }
-    let tilt = (fc / 1000.0).powf(p.tilt_db / 3.0103);
-    let db = 10.0 * (e * tilt / reference).log10();
+    let tilt = p.tilt_db * (fc / 1000.0).log2();
+    let weight = if p.loudness > 0.0 { tilt + (crate::dsp::perceived_gain_db(fc, p.phon, p.felt_bass) - tilt) * p.loudness } else { tilt };
+    let db = 10.0 * (e / reference).log10() + weight;
     ((db + p.db_range) / p.db_range.max(1.0)).clamp(0.0, 1.0).powf(p.bright_curve)
 }
 

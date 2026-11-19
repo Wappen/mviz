@@ -45,8 +45,22 @@ pub struct Params {
     /// Treble boost (dB per octave).
     pub tilt_db: f32,
     pub saturation: f32,
+    /// Every hue emits the same light (0 = natural: yellow far brighter than
+    /// blue; 1 = equal, so brightness shows only loudness, not the note).
+    pub even_hues: f32,
     /// Evens out light where neighbouring bands' glows overlap.
     pub density: f32,
+    /// Brightness follows perceived loudness (heard per ISO 226, plus deep
+    /// bass felt in the body) instead of the plain treble boost:
+    /// 0 = treble boost only, 1 = perceived loudness only.
+    pub loudness: f32,
+    /// Listening level (phon): quieter = less bass heard, and none felt.
+    pub phon: f32,
+    /// How strongly deep bass is felt (dB, relative to hearing 1 kHz).
+    pub felt_bass: f32,
+    /// Sounds without a clear pitch (noise, cymbals, breath) lose this much
+    /// of their colour (0 = all coloured, 1 = noise fully white).
+    pub noise_white: f32,
     /// Bright light rolls off softly above this level.
     pub knee: f32,
 
@@ -80,6 +94,9 @@ pub struct Params {
     /// Peak brightness of the bass background glow, and its curve.
     pub flash_max: f32,
     pub bass_curve: f32,
+    /// Unpitched bass (rumble, noisy kicks) loses this much of the
+    /// background's colour (0 = always coloured, 1 = fully white).
+    pub bg_noise_white: f32,
     /// Background colour without bass (RGB).
     pub base: [f32; 3],
 }
@@ -97,7 +114,7 @@ impl Params {
         min_spot: 0.006,
         carpet_width: 0.8,
         carpet_flat: 0.25,
-        carpet_power: 3.0,
+        carpet_power: 4.5,
         diffuse_grow: 2.0,
         diffuse_dim: 1.5,
         diffuse_start: 0.92,
@@ -106,8 +123,13 @@ impl Params {
         db_range: 42.0,
         bright_curve: 1.6,
         tilt_db: 3.0,
-        saturation: 0.6,
+        saturation: 0.9,
+        even_hues: 1.0,
         density: 2.5,
+        loudness: 0.5,
+        phon: 100.0,
+        felt_bass: 0.0,
+        noise_white: 1.0,
         knee: 0.8,
         fade: 0.25,
         fade_blur: 1.2,
@@ -121,8 +143,9 @@ impl Params {
         trust_hi: 0.6,
         polarity_threshold: 0.5,
         edge_split: 1.7,
-        flash_max: 0.3,
+        flash_max: 0.2,
         bass_curve: 1.6,
+        bg_noise_white: 0.5,
         base: [0.012, 0.014, 0.03],
     };
 }

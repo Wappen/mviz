@@ -27,7 +27,7 @@
 
 use super::stereo::{spot_size, timing_weight, y_of, Stats, Stereo};
 use crate::params::{self, Params};
-use crate::dsp::{hsv, hz_to_midi, pitch_hue};
+use crate::dsp::{glow_colour, hz_to_midi, pitch_hue};
 use crate::gfx::Batch;
 use rustfft::num_complex::Complex32;
 use std::f32::consts::{FRAC_PI_4, PI, TAU};
@@ -84,6 +84,12 @@ pub fn draw(st: &Stereo, out: &mut Batch, w: f32, h: f32) {
         // Keep total light per area steady where neighbouring bands' glows overlap.
         let (_, band_ry) = spot_size(&p, band.fc, w, h);
         let density = (p.density * dy(b) * h / band_ry).min(1.0);
+        // Noise has no pitch, so no pitch colour.
+        let saturation = if p.noise_white > 0.0 {
+            p.saturation * (1.0 - p.noise_white * (1.0 - tonality(st, band)))
+        } else {
+            p.saturation
+        };
         for part in &band.parts {
             let [sl, sr] = &st.spec[part.res];
             let hz = st.bin_hz[part.res];
@@ -109,7 +115,7 @@ pub fn draw(st: &Stereo, out: &mut Batch, w: f32, h: f32) {
                 ry *= grow;
                 light /= 1.0 + p.diffuse_dim * diffuse;
 
-                let c = hsv(pitch_hue(hz_to_midi(f)), p.saturation, 1.0, 1.0);
+                let c = glow_colour(pitch_hue(hz_to_midi(f)), saturation, p.even_hues);
                 let y = y_of(&p, f) * h;
                 // Near-fully out of phase lies at both far edges at once (the
                 // same direction): share it, so it cannot jump edge to edge.
@@ -122,6 +128,45 @@ pub fn draw(st: &Stereo, out: &mut Batch, w: f32, h: f32) {
             }
         }
     }
+}
+
+/// How far (dB) a band's strongest bin must stand out above its neighbours
+/// to count as a pitch: up to `PEAK_NOISE_DB` is noise, from `PEAK_TONE_DB`
+/// a clear tone.
+const PEAK_NOISE_DB: f32 = 4.0;
+const PEAK_TONE_DB: f32 = 12.0;
+
+/// How pitched a band sounds, 0 (noise) to 1 (clear tone), from the
+/// smoothed spectrum: a tone is a narrow peak with deep valleys right next
+/// to it on both sides; noise has none. Comparing with the higher valley
+/// keeps a steep edge (like an MP3's cutoff at 16 kHz) from looking like a
+/// tone.
+pub(super) fn tonality(st: &Stereo, band: &super::stereo::Band) -> f32 {
+    let Some(part) = band.parts.iter().max_by(|a, b| a.weight.total_cmp(&b.weight)) else { return 1.0 };
+    let bins = &st.bins[part.res];
+    let hz = st.bin_hz[part.res];
+    // The longest FFT (bass) spans 170 ms, so the short average barely
+    // smooths noise there: use the slow one.
+    let slow = super::stereo::RES[part.res].0 >= 8192;
+    let power = |k: usize| {
+        let s = &bins[k];
+        if slow { s.slow_l2 + s.slow_r2 } else { s.l2 + s.r2 }
+    };
+    // Bins below the lowest band are never analysed (they stay zero).
+    let lowest = st.bands.first().map_or(1, |b| (b.fc * 0.98 / hz).ceil() as usize).max(1);
+    let centre = (band.fc / hz).round() as usize;
+    let lo = part.k0.min(centre.saturating_sub(1)).max(lowest);
+    let hi = part.k1.max(centre + 2).min(bins.len());
+    let Some(peak) = (lo..hi).max_by(|&a, &b| power(a).total_cmp(&power(b))) else { return 1.0 };
+    // The valley on each side: the lowest bin 2–5 bins away (a Hann
+    // window's main lobe is ±2 bins). A tone has a deep valley next to it
+    // even when the next partial is close (harmonics of a deep note).
+    let side = |ks: std::ops::RangeInclusive<usize>| ks.filter(|&k| k >= lowest && k < bins.len()).map(power).reduce(f32::min);
+    let left = side(peak.saturating_sub(5)..=peak.saturating_sub(2)).filter(|_| peak >= 2 + lowest);
+    let right = side(peak + 2..=peak + 5);
+    let Some(around) = left.into_iter().chain(right).reduce(f32::max) else { return 1.0 };
+    let db = 10.0 * ((power(peak) + 1e-20) / (around + 1e-20)).log10();
+    ((db - PEAK_NOISE_DB) / (PEAK_TONE_DB - PEAK_NOISE_DB)).clamp(0.0, 1.0)
 }
 
 /// The dominant direction of a covariance: its principal eigenvector.
@@ -289,6 +334,114 @@ mod tests {
                 assert!(x > prev, "not monotonic at w {w}");
                 prev = x;
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tonality_tests {
+    use super::*;
+    use crate::audio::Track;
+
+    /// Average tonality of the bands between `lo` and `hi` Hz after playing
+    /// `signal` (mono, both channels) for a second at 60 frames per second.
+    fn measure(signal: impl Fn(usize) -> f32, lo: f32, hi: f32) -> f32 {
+        let rate = 48000;
+        let samples: Vec<f32> = (0..rate as usize * 2).flat_map(|i| [signal(i), signal(i)]).collect();
+        let track = Track::from_interleaved(&samples, rate);
+        let mut st = Stereo::new(rate);
+        let mut gfx = crate::gfx::Batch::default();
+        for f in 0..60 {
+            let _ = st.draw(&mut gfx, &track, rate, 24000.0 + f as f64 * 800.0, 1.0 / 60.0, None, 800.0, 600.0);
+        }
+        let t: Vec<f32> = st.bands.iter().filter(|b| b.fc >= lo && b.fc <= hi).map(|b| tonality(&st, b)).collect();
+        t.iter().sum::<f32>() / t.len() as f32
+    }
+
+    fn noise() -> impl Fn(usize) -> f32 {
+        // Deterministic white noise (a hash of the sample index).
+        |i| {
+            let mut x = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            x ^= x >> 29;
+            x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            x ^= x >> 32;
+            (x as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32 * 0.3
+        }
+    }
+
+    /// Brightness-weighted tonality of the bands between `lo` and `hi` Hz.
+    fn measure_seen(signal: impl Fn(usize) -> f32, lo: f32, hi: f32) -> f32 {
+        let rate = 48000;
+        let samples: Vec<f32> = (0..rate as usize * 2).flat_map(|i| [signal(i), signal(i)]).collect();
+        let track = Track::from_interleaved(&samples, rate);
+        let mut st = Stereo::new(rate);
+        let mut gfx = crate::gfx::Batch::default();
+        for f in 0..60 {
+            let _ = st.draw(&mut gfx, &track, rate, 24000.0 + f as f64 * 800.0, 1.0 / 60.0, None, 800.0, 600.0);
+        }
+        let (mut t, mut w) = (0.0, 0.0);
+        for (g, b) in st.live.iter().zip(&st.bands).filter(|(_, b)| b.fc >= lo && b.fc <= hi) {
+            t += tonality(&st, b) * g.bright;
+            w += g.bright;
+        }
+        t / w.max(1e-9)
+    }
+
+    /// A deep note's harmonics lie only a few bins apart, yet are pitched.
+    #[test]
+    fn harmonics_of_deep_notes_are_pitched() {
+        for f0 in [41.2, 55.0, 110.0, 220.0] {
+            let saw = |i: usize| 0.3 * (2.0 * (f0 * i as f32 / 48000.0).fract() - 1.0);
+            for (lo, hi) in [(35.0, 120.0), (120.0, 500.0), (500.0, 2000.0)] {
+                let t = measure_seen(&saw, lo, hi);
+                assert!(t > 0.7, "sawtooth at {f0} Hz, {lo}–{hi} Hz: tonality {t}");
+            }
+        }
+    }
+
+    #[test]
+    fn noise_is_unpitched_and_tones_are_pitched() {
+        let n = noise();
+        for (lo, hi) in [(35.0, 100.0), (100.0, 300.0), (300.0, 2000.0), (2000.0, 12000.0)] {
+            let tn = measure(&n, lo, hi);
+            // A tone at the middle of the range, measured at its own band.
+            let f = (lo * hi as f32).sqrt();
+            let tt = measure(|i| 0.3 * (std::f32::consts::TAU * f * i as f32 / 48000.0).sin(), f * 0.985, f * 1.015);
+            println!("{lo}–{hi} Hz: noise {tn:.2}, tone {tt:.2}");
+            assert!(tn < 0.25, "noise at {lo}–{hi} Hz counted as pitched: {tn}");
+            assert!(tt > 0.75, "tone at {f} Hz counted as noise: {tt}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tonality_real {
+    use super::*;
+
+    /// `MVIZ_FILE=song.mp3 cargo test --release tonality_by_range -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn tonality_by_range() {
+        let path = std::env::var("MVIZ_FILE").expect("set MVIZ_FILE");
+        let track = crate::audio::load(std::path::Path::new(&path)).unwrap();
+        let rate = track.rate;
+        let mut st = Stereo::new(rate);
+        let mut gfx = crate::gfx::Batch::default();
+        let ranges = [(40.0, 120.0), (120.0, 500.0), (500.0, 2000.0), (2000.0, 4000.0), (4000.0, 8000.0), (8000.0, 12000.0), (12000.0, 14000.0), (14000.0, 16000.0), (16000.0, 18000.0), (18000.0, 20000.0)];
+        let mut acc = vec![(0.0f64, 0.0f64, 0usize); ranges.len()];
+        let start = rate as f64 * 30.0;
+        for f in 0..(60 * 40) {
+            let _ = st.draw(&mut gfx, &track, rate, start + f as f64 * rate as f64 / 60.0, 1.0 / 60.0, None, 800.0, 600.0);
+            if f % 30 != 0 { continue; }
+            for (r, a) in ranges.iter().zip(acc.iter_mut()) {
+                for (g, b) in st.live.iter().zip(&st.bands).filter(|(_, b)| b.fc >= r.0 && b.fc < r.1) {
+                    a.0 += (tonality(&st, b) * g.bright) as f64; a.1 += g.bright as f64; a.2 += 1;
+                }
+            }
+        }
+        for (r, a) in ranges.iter().zip(&acc) {
+            // Tonality weighted by brightness: of the light actually seen.
+            println!("{:>5.0}–{:<5.0} Hz: tonality {:.2}  brightness {:.3}", r.0, r.1, a.0 / a.1.max(1e-9), a.1 / a.2 as f64);
         }
     }
 }
