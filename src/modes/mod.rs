@@ -27,12 +27,14 @@ pub fn base() -> Rgba {
 /// Dark background lit by the low-passed bass (each side by its own
 /// channel), at `strength` (0..1). Its hue is the pitch class of the latest
 /// bass note. Plain until the analysis (`tl`) is available.
-pub fn draw_background(out: &mut Batch, tl: Option<&Timeline>, t: f32, strength: f32, w: f32, h: f32) {
-    let Some(tl) = tl.filter(|_| strength > 0.0) else {
-        let b = base();
-        out.rect(0.0, 0.0, w, h, b);
-        return;
-    };
+///
+/// The dark base goes into `base`; the bass light goes into `light`, the
+/// phosphor's live layer, so it gets the same afterglow as the field: a new
+/// bass note's colour appears at once while the previous one fades out, and
+/// the glow fades out after the bass instead of switching off.
+pub fn draw_background(base_out: &mut Batch, light: &mut Batch, tl: Option<&Timeline>, t: f32, strength: f32, w: f32, h: f32) {
+    base_out.rect(0.0, 0.0, w, h, base());
+    let Some(tl) = tl.filter(|_| strength > 0.0) else { return };
     let i = tl.bass.partition_point(|b| b.t <= t);
     let hue = i.checked_sub(1).map_or(0.6, |i| tl.bass[i].pc / 12.0);
     let c = hsv(hue, 0.85, 1.0, 1.0);
@@ -41,7 +43,7 @@ pub fn draw_background(out: &mut Batch, tl: Option<&Timeline>, t: f32, strength:
     let shape = |a: f32| a.clamp(0.0, 1.2).powf(p.bass_curve);
     let (l, r) = bass_level(tl, t);
     let (gl, gr) = (shape(l), shape(r));
-    let (b, m) = (p.base, p.flash_max * strength);
-    let lit = |g: f32| [b[0] + c[0] * m * g, b[1] + c[1] * m * g, b[2] + c[2] * m * g, 1.0];
-    out.gradient_h(0.0, 0.0, w, h, lit(gl), lit(gr));
+    let m = p.flash_max * strength;
+    let lit = |g: f32| [c[0] * m * g, c[1] * m * g, c[2] * m * g, 1.0];
+    light.gradient_h(0.0, 0.0, w, h, lit(gl), lit(gr));
 }

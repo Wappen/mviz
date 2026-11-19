@@ -119,36 +119,76 @@ pub fn analyze(track: &Track, progress: &AtomicU32) -> Timeline {
     Timeline { hop: hop_s, bass, bass_env, stereo_ref }
 }
 
-/// Amplitude of each channel after a 2nd-order low-pass (80 Hz, Q 0.5):
-/// flat below 80 Hz, -12 dB/octave above, so sub-bass drives it and
-/// anything above ~150 Hz barely does. RMS over ~46 ms around each hop,
-/// normalised so the loud parts of the song sit near 1.0.
-fn bass_envelope(track: &Track, rate: u32, n_hops: usize) -> Vec<(f32, f32)> {
-    let (fc, q) = (80.0f64, 0.5f64);
-    let w0 = std::f64::consts::TAU * fc / rate as f64;
-    let (cw, alpha) = (w0.cos(), w0.sin() / (2.0 * q));
-    let a0 = 1.0 + alpha;
-    let (b0, b1, b2) = ((1.0 - cw) / 2.0 / a0, (1.0 - cw) / a0, (1.0 - cw) / 2.0 / a0);
-    let (a1, a2) = (-2.0 * cw / a0, (1.0 - alpha) / a0);
+/// A 2nd-order low-pass (RBJ biquad) at `fc` for sample rate `rate`.
+struct LowPass {
+    b: [f64; 3],
+    a: [f64; 2],
+    x: [f64; 2],
+    y: [f64; 2],
+}
 
-    // Sum of squares per hop-sized block, per channel.
-    let mut blocks = vec![[0f64; 2]; n_hops];
-    for ch in 0..2 {
-        let (mut x1, mut x2, mut y1, mut y2) = (0.0, 0.0, 0.0, 0.0);
-        for (i, frame) in track.frames().enumerate() {
-            let x = frame[ch] as f64;
-            let y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
-            (x2, x1, y2, y1) = (x1, x, y1, y);
-            blocks[(i / HOP).min(n_hops - 1)][ch] += y * y;
+impl LowPass {
+    fn new(fc: f64, q: f64, rate: f64) -> Self {
+        let w0 = std::f64::consts::TAU * fc / rate;
+        let (cw, alpha) = (w0.cos(), w0.sin() / (2.0 * q));
+        let a0 = 1.0 + alpha;
+        Self {
+            b: [(1.0 - cw) / 2.0 / a0, (1.0 - cw) / a0, (1.0 - cw) / 2.0 / a0],
+            a: [-2.0 * cw / a0, (1.0 - alpha) / a0],
+            x: [0.0; 2],
+            y: [0.0; 2],
         }
     }
-    // Two blocks either side of each hop centre: a 4 x 512 = 2048-sample window.
+
+    fn run(&mut self, x: f64) -> f64 {
+        let y = self.b[0] * x + self.b[1] * self.x[0] + self.b[2] * self.x[1] - self.a[0] * self.y[0] - self.a[1] * self.y[1];
+        self.x = [x, self.x[0]];
+        self.y = [y, self.y[0]];
+        y
+    }
+}
+
+/// Samples per block when the bass power is reduced in rate (before the
+/// envelope filter, which only keeps changes below `ENVELOPE_HZ`).
+const ENV_BLOCK: usize = 32;
+/// How fast the background may follow the bass. Must stay well below twice
+/// the lowest bass frequency (≈ 60 Hz), so the glow follows the bass's
+/// loudness, not its individual waves.
+const ENVELOPE_HZ: f64 = 10.0;
+
+/// Loudness of each channel's bass, for the background glow.
+/// The bass is a 2nd-order low-pass (80 Hz, Q 0.5): flat below 80 Hz,
+/// −12 dB/octave above, so sub-bass drives it and anything above ~150 Hz
+/// barely does. Its power is then smoothed by a 10 Hz low-pass run forwards
+/// and backwards (no delay): that removes the ripple of each bass wave
+/// (twice its frequency: 60 Hz and up), which a short measuring window
+/// would turn into flicker, while keeping hits and swells. Normalised so the
+/// loud parts of the song sit near 1.0; one value per hop.
+fn bass_envelope(track: &Track, rate: u32, n_hops: usize) -> Vec<(f32, f32)> {
+    let n = track.total().unwrap_or(0);
+    let blocks = n.div_ceil(ENV_BLOCK).max(1);
+    let mut power = vec![[0f64; 2]; blocks];
+    for ch in 0..2 {
+        let mut bass = LowPass::new(80.0, 0.5, rate as f64);
+        for (i, frame) in track.frames().enumerate() {
+            let y = bass.run(frame[ch] as f64);
+            power[i / ENV_BLOCK][ch] += y * y / ENV_BLOCK as f64;
+        }
+        // Zero-phase smoothing: forwards, then backwards.
+        let block_rate = rate as f64 / ENV_BLOCK as f64;
+        let mut smooth = LowPass::new(ENVELOPE_HZ, std::f64::consts::FRAC_1_SQRT_2, block_rate);
+        for p in power.iter_mut() {
+            p[ch] = smooth.run(p[ch]);
+        }
+        let mut smooth = LowPass::new(ENVELOPE_HZ, std::f64::consts::FRAC_1_SQRT_2, block_rate);
+        for p in power.iter_mut().rev() {
+            p[ch] = smooth.run(p[ch]);
+        }
+    }
     let rms: Vec<(f32, f32)> = (0..n_hops)
         .map(|i| {
-            let r = i.saturating_sub(2)..(i + 2).min(n_hops);
-            let n = (r.len() * HOP) as f64;
-            let (l, rr) = blocks[r].iter().fold((0.0, 0.0), |a, b| (a.0 + b[0], a.1 + b[1]));
-            ((l / n).sqrt() as f32, (rr / n).sqrt() as f32)
+            let p = power[((i * HOP) / ENV_BLOCK).min(blocks - 1)];
+            (p[0].max(0.0).sqrt() as f32, p[1].max(0.0).sqrt() as f32)
         })
         .collect();
     let mut mono: Vec<f32> = rms.iter().map(|&(l, r)| ((l * l + r * r) / 2.0).sqrt()).collect();
@@ -230,6 +270,40 @@ mod tests {
 }
 
 #[cfg(test)]
+mod bass_glow {
+    use super::*;
+    use std::f32::consts::TAU;
+
+    /// Peak-to-peak ripple of the background level (as a share of its mean)
+    /// for a steady bass note: the background should not pulse with the wave.
+    fn ripple(freq: f32) -> f32 {
+        let rate = 48000;
+        let samples: Vec<f32> = (0..rate * 3)
+            .flat_map(|i| {
+                let v = (TAU * freq * i as f32 / rate as f32).sin() * 0.5;
+                [v, v]
+            })
+            .collect();
+        let track = crate::audio::Track::from_interleaved(&samples, rate as u32);
+        let env = bass_envelope(&track, rate as u32, samples.len() / 2 / HOP + 1);
+        // Steady middle second only (no start/end transients).
+        let mid: Vec<f32> = env[env.len() / 3..2 * env.len() / 3].iter().map(|e| e.0).collect();
+        let (lo, hi) = mid.iter().fold((f32::MAX, 0.0f32), |a, &v| (a.0.min(v), a.1.max(v)));
+        let mean = mid.iter().sum::<f32>() / mid.len() as f32;
+        (hi - lo) / mean
+    }
+
+    #[test]
+    fn steady_deep_bass_gives_a_steady_glow() {
+        for f in [30.0, 41.0, 55.0, 70.0] {
+            let r = ripple(f);
+            println!("{f} Hz: ripple {:.1} %", r * 100.0);
+            assert!(r < 0.03, "{f} Hz: background ripples by {:.1} %", r * 100.0);
+        }
+    }
+}
+
+#[cfg(test)]
 mod real_file {
     /// `MVIZ_FILE=song.mp3 cargo test --release real_file -- --ignored --nocapture`
     #[test]
@@ -252,5 +326,18 @@ mod real_file {
         env.sort_by(f32::total_cmp);
         let q = |p: f32| env[((env.len() - 1) as f32 * p) as usize];
         println!("  bass envelope p10 {:.2} p50 {:.2} p90 {:.2} max {:.2}", q(0.1), q(0.5), q(0.9), q(1.0));
+        // Flicker: frame-to-frame jitter of the glow at 60 fps (second difference,
+        // relative to the mean level).
+        let at = |t: f64| {
+            let x = (t / tl.hop as f64).max(0.0);
+            let i = (x as usize).min(tl.bass_env.len() - 2);
+            let (a, b) = (tl.bass_env[i].0, tl.bass_env[i + 1].0);
+            a + (b - a) * (x - i as f64) as f32
+        };
+        let n = (secs as f64 * 60.0) as usize - 2;
+        let vals: Vec<f32> = (0..n).map(|k| at(k as f64 / 60.0)).collect();
+        let mean = vals.iter().sum::<f32>() / vals.len() as f32;
+        let jitter = vals.windows(3).map(|w| (w[0] - 2.0 * w[1] + w[2]).abs()).sum::<f32>() / (vals.len() - 2) as f32;
+        println!("  glow jitter {:.2} % of mean level per frame", 100.0 * jitter / mean);
     }
 }

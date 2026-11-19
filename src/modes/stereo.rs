@@ -282,8 +282,8 @@ impl Stereo {
         if tl.is_some() {
             self.background = (self.background + dt.min(0.1) / 0.6).min(1.0);
         }
-        draw_background(background, tl, (frame / rate as f64) as f32, self.background, w, h);
         let mut live = Batch::default();
+        draw_background(background, &mut live, tl, (frame / rate as f64) as f32, self.background, w, h);
         super::field::draw(self, &mut live, w, h);
         PhosphorFrame { live, advance }
     }
