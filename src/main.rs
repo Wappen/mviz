@@ -195,7 +195,8 @@ impl ApplicationHandler for App {
         if self.gfx.is_some() {
             return;
         }
-        let attrs = Window::default_attributes().with_title("mviz").with_inner_size(LogicalSize::new(1280.0, 800.0));
+        let title = format!("{} — mviz", self.playing.ui.title);
+        let attrs = Window::default_attributes().with_title(title).with_inner_size(LogicalSize::new(1280.0, 800.0));
         // Declare the app id "mviz" (Wayland) / class "mviz" (X11), so the
         // desktop matches the window to mviz.desktop and shows its icon.
         let attrs = winit::platform::wayland::WindowAttributesExtWayland::with_name(attrs, "mviz", "mviz");
@@ -287,7 +288,8 @@ fn main() {
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
     let now = Instant::now();
-    let playing = Playing { stereo: Stereo::new(player.rate), player, mpris, told, tl: None, rx, ui: ui::Ui::new(0.0), dim: 0.0 };
+    let ui = ui::Ui::new(0.0, name.clone());
+    let playing = Playing { stereo: Stereo::new(player.rate), player, mpris, told, tl: None, rx, ui, dim: 0.0 };
     let mut app = App { playing, gfx: None, start: now, last_frame: now };
     event_loop.run_app(&mut app).expect("run");
 }

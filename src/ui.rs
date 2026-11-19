@@ -13,6 +13,9 @@ use winit::event::MouseButton;
 use winit::window::{Fullscreen, Window};
 
 const ZONE: f32 = 96.0;
+/// Height of the dark shade behind the controls (taller than `ZONE`, so it
+/// also covers the title).
+const SHADE: f32 = 128.0;
 const IDLE: f64 = 2.0;
 const PAD: f32 = 16.0;
 const WAVE_H: f32 = 36.0;
@@ -31,6 +34,8 @@ enum Drag {
 }
 
 pub struct Ui {
+    /// Shown above the timeline (the song's file name).
+    pub title: String,
     mouse: (f32, f32),
     mouse_in: bool,
     last_move: f64,
@@ -47,8 +52,9 @@ fn white(a: f32) -> Rgba {
 }
 
 impl Ui {
-    pub fn new(now: f64) -> Self {
+    pub fn new(now: f64, title: String) -> Self {
         Self {
+            title,
             mouse: (0.0, 0.0),
             mouse_in: false,
             last_move: now,
@@ -176,7 +182,7 @@ impl Ui {
         if a > 0.01 {
             // Soft shade behind the controls.
             // One smooth gradient (stacked strips overlapped into dark lines).
-            ui.gradient_v(0.0, h - ZONE, w, ZONE, [0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.6 * a]);
+            ui.gradient_v(0.0, h - SHADE, w, SHADE, [0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.6 * a]);
 
             let dur = player.duration();
             let cur = player.position() / player.rate as f64;
@@ -209,6 +215,17 @@ impl Ui {
             ui.rect(played_x - 1.0, mid - WAVE_H / 2.0 - 3.0, 2.0, WAVE_H + 6.0, white(0.95 * a));
 
             let label_y = mid - WAVE_H / 2.0 - 30.0;
+
+            // The song's name above the time, shortened with "…" if too long.
+            let max_w = w - 2.0 * PAD;
+            let mut title = self.title.clone();
+            if measure(&title, 18.0) > max_w {
+                while !title.is_empty() && measure(&format!("{title}…"), 18.0) > max_w {
+                    title.pop();
+                }
+                title = format!("{}…", title.trim_end());
+            }
+            text(title, PAD, label_y - 26.0, 18.0, white(0.92 * a));
             text(format!("{} / {}", fmt_time(cur), fmt_time(dur)), PAD, label_y, 15.0, white(0.8 * a));
             if player.paused() {
                 let tw = measure("paused", 15.0);
