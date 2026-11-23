@@ -1,13 +1,17 @@
 //! Minimal controls:
 //!   right-click / Space pause / resume
-//!   wheel               volume
+//!   wheel               volume (over the playlist: scroll it)
 //!   left-drag           move the window (from fullscreen: leaves
 //!                       fullscreen, then moves the window)
 //!   double left-click   fullscreen on/off (and bring to front), or F11
 //!   waveform timeline   at the bottom while the cursor is visible over the
-//!                       window (click or drag on it to seek)
+//!                       window (click or drag on it to seek; live input
+//!                       shows the last 30 s instead)
+//!   playlist            playing a folder: at the right edge (or L pins it);
+//!                       click a song to play it
 
 use crate::audio::Player;
+use crate::capture::Capture;
 use crate::gfx::{Batch, Rgba, Text};
 use winit::event::MouseButton;
 use winit::window::{Fullscreen, Window};
@@ -24,6 +28,100 @@ const DOUBLE_CLICK: f64 = 0.35;
 const DRAG_START: f32 = 4.0;
 /// Touchpad scrolling: pixels per volume step.
 const SCROLL_STEP_PX: f32 = 40.0;
+/// Live input: seconds of overview in the timeline.
+pub const LIVE_SECS: f64 = 30.0;
+
+/// Playlist panel: width of the list, the shade behind it, the edge that
+/// opens it, and its rows.
+const PANEL_W: f32 = 340.0;
+const PANEL_SHADE: f32 = 560.0;
+const PANEL_EDGE: f32 = 48.0;
+const PANEL_TOP: f32 = 32.0;
+const ROWS_TOP: f32 = PANEL_TOP + 52.0;
+const ROW_H: f32 = 36.0;
+
+/// What plays: a song (`Player`) or live input (`Capture`).
+pub trait Transport {
+    fn paused(&self) -> bool;
+    fn toggle_pause(&mut self);
+    /// Length in seconds; `None` for live input (no seeking).
+    fn duration(&self) -> Option<f64>;
+    fn scrub(&mut self, _secs: f64) {}
+    fn end_scrub(&mut self) {}
+    /// `None`: no volume of its own (live input is heard elsewhere).
+    fn volume(&self) -> Option<f32>;
+    fn set_volume(&self, _v: f32) {}
+}
+
+impl Transport for Player {
+    fn paused(&self) -> bool {
+        Player::paused(self)
+    }
+    fn toggle_pause(&mut self) {
+        Player::toggle_pause(self)
+    }
+    fn duration(&self) -> Option<f64> {
+        Some(Player::duration(self))
+    }
+    fn scrub(&mut self, secs: f64) {
+        Player::scrub(self, secs)
+    }
+    fn end_scrub(&mut self) {
+        Player::end_scrub(self)
+    }
+    fn volume(&self) -> Option<f32> {
+        Some(Player::volume(self))
+    }
+    fn set_volume(&self, v: f32) {
+        Player::set_volume(self, v)
+    }
+}
+
+impl Transport for Capture {
+    fn paused(&self) -> bool {
+        Capture::paused(self)
+    }
+    fn toggle_pause(&mut self) {
+        Capture::toggle_pause(self)
+    }
+    fn duration(&self) -> Option<f64> {
+        None
+    }
+    fn volume(&self) -> Option<f32> {
+        None
+    }
+}
+
+/// A folder being played, for the playlist panel.
+pub struct PlaylistView<'a> {
+    pub name: &'a str,
+    pub songs: &'a [String],
+    pub lengths: &'a [Option<f64>],
+    pub current: usize,
+}
+
+/// What the controls show this frame.
+pub struct Status<'a> {
+    pub title: &'a str,
+    /// Dimmer, after the title (folder position, or the source's kind).
+    pub subtitle: &'a str,
+    pub paused: bool,
+    /// (position, length) in seconds; `None` for live input.
+    pub time: Option<(f64, f64)>,
+    /// The overview: (peak, rms) buckets, and how many make up the whole
+    /// timeline. A song fills it from the left as it decodes; live input is
+    /// right-aligned (newest at the right edge).
+    pub waveform: &'a [(f32, f32)],
+    pub expected: usize,
+    pub volume: Option<f32>,
+    pub playlist: Option<PlaylistView<'a>>,
+}
+
+/// Something the controls ask for that the app carries out.
+pub enum Action {
+    /// Play this song of the playlist.
+    Play(usize),
+}
 
 #[derive(PartialEq)]
 enum Drag {
@@ -34,8 +132,6 @@ enum Drag {
 }
 
 pub struct Ui {
-    /// Shown above the timeline (the song's file name).
-    pub title: String,
     mouse: (f32, f32),
     mouse_in: bool,
     last_move: f64,
@@ -45,16 +141,37 @@ pub struct Ui {
     scroll_px: f32,
     vol_shown: f64,
     cursor_visible: bool,
+    /// The timeline and playlist are available (not while the start screen is up).
+    pub controls: bool,
+    /// Songs in the playlist (0: none) and the one playing.
+    songs: usize,
+    current: usize,
+    panel_alpha: f32,
+    /// L: keep the playlist open.
+    pub panel_pinned: bool,
+    /// First row shown.
+    panel_scroll: usize,
 }
 
 fn white(a: f32) -> Rgba {
     [1.0, 1.0, 1.0, a]
 }
 
+/// `s` shortened with "…" to fit `max_w`.
+pub fn fit(s: &str, size: f32, max_w: f32, measure: &mut dyn FnMut(&str, f32) -> f32) -> String {
+    if measure(s, size) <= max_w {
+        return s.to_string();
+    }
+    let mut t = s.to_string();
+    while !t.is_empty() && measure(&format!("{t}…"), size) > max_w {
+        t.pop();
+    }
+    format!("{}…", t.trim_end())
+}
+
 impl Ui {
-    pub fn new(now: f64, title: String) -> Self {
+    pub fn new(now: f64) -> Self {
         Self {
-            title,
             mouse: (0.0, 0.0),
             mouse_in: false,
             last_move: now,
@@ -64,7 +181,17 @@ impl Ui {
             scroll_px: 0.0,
             vol_shown: f64::NEG_INFINITY,
             cursor_visible: true,
+            controls: false,
+            songs: 0,
+            current: 0,
+            panel_alpha: 0.0,
+            panel_pinned: false,
+            panel_scroll: 0,
         }
+    }
+
+    pub fn mouse(&self) -> (f32, f32) {
+        self.mouse
     }
 
     fn in_zone(&self, h: f32) -> bool {
@@ -73,6 +200,31 @@ impl Ui {
 
     fn time_at(x: f32, w: f32, duration: f64) -> f64 {
         ((x - PAD) / (w - 2.0 * PAD)).clamp(0.0, 1.0) as f64 * duration
+    }
+
+    fn panel_x(w: f32) -> f32 {
+        w - PAD - PANEL_W
+    }
+
+    /// Rows of the playlist that fit above the timeline.
+    fn panel_rows(h: f32) -> usize {
+        (((h - SHADE - ROWS_TOP) / ROW_H).floor().max(1.0)) as usize
+    }
+
+    /// The cursor is over the open playlist.
+    fn over_panel(&self, w: f32) -> bool {
+        self.songs > 0 && self.panel_alpha > 0.5 && self.mouse_in && self.mouse.0 > Self::panel_x(w) - 24.0
+    }
+
+    /// The playlist row under the cursor.
+    fn panel_hit(&self, size: (f32, f32)) -> Option<usize> {
+        let (w, h) = size;
+        let (x, y) = self.mouse;
+        if !self.over_panel(w) || x < Self::panel_x(w) || y < ROWS_TOP {
+            return None;
+        }
+        let row = ((y - ROWS_TOP) / ROW_H) as usize;
+        (row < Self::panel_rows(h)).then_some(self.panel_scroll + row).filter(|&i| i < self.songs)
     }
 
     /// Cursor position in logical pixels.
@@ -99,15 +251,29 @@ impl Ui {
         self.mouse_in = false;
     }
 
-    pub fn button(&mut self, button: MouseButton, pressed: bool, now: f64, window: &Window, player: &mut Player, size: (f32, f32)) {
+    /// A mouse button. Window moves and fullscreen work everywhere; seeking,
+    /// pausing and the playlist only with `transport` (something playing,
+    /// start screen closed).
+    pub fn button(&mut self, button: MouseButton, pressed: bool, now: f64, window: &Window, transport: Option<&mut dyn Transport>, size: (f32, f32)) -> Option<Action> {
         let (w, h) = size;
+        let controls = self.controls;
+        let mut transport = transport.filter(|_| controls);
         match (button, pressed) {
-            (MouseButton::Right, true) => player.toggle_pause(),
+            (MouseButton::Right, true) => {
+                if let Some(t) = transport {
+                    t.toggle_pause();
+                }
+            }
             (MouseButton::Left, true) => {
                 let (x, y) = self.mouse;
-                if self.in_zone(h) && self.bar_alpha > 0.3 {
+                let duration = transport.as_ref().and_then(|t| t.duration());
+                if let Some(i) = self.panel_hit(size).filter(|_| controls) {
+                    return Some(Action::Play(i));
+                } else if controls && self.over_panel(w) {
+                    // Inside the playlist but not on a song: nothing.
+                } else if let (Some(t), Some(d), true) = (transport.as_mut(), duration, self.in_zone(h) && self.bar_alpha > 0.3) {
                     self.drag = Drag::Seek;
-                    player.scrub(Self::time_at(x, w, player.duration()));
+                    t.scrub(Self::time_at(x, w, d));
                 } else if now - self.last_click.0 < DOUBLE_CLICK && (x - self.last_click.1).hypot(y - self.last_click.2) < 6.0 {
                     toggle_fullscreen(window);
                     self.last_click.0 = f64::NEG_INFINITY;
@@ -119,136 +285,230 @@ impl Ui {
             }
             (MouseButton::Left, false) => {
                 if self.drag == Drag::Seek {
-                    player.end_scrub();
+                    if let Some(t) = transport {
+                        t.end_scrub();
+                    }
                 }
                 self.drag = Drag::None;
             }
             _ => {}
         }
+        None
     }
 
     /// Mouse wheel: `lines` for notched wheels, `pixels` for touchpads.
-    pub fn wheel(&mut self, lines: f32, pixels: f32, now: f64, player: &Player) {
+    pub fn wheel(&mut self, lines: f32, pixels: f32, now: f64, transport: Option<&dyn Transport>, size: (f32, f32)) {
         let mut steps = if lines > 0.0 { 1 } else if lines < 0.0 { -1 } else { 0 };
         if pixels != 0.0 {
             self.scroll_px += pixels;
             steps = (self.scroll_px / SCROLL_STEP_PX) as i32;
             self.scroll_px -= steps as f32 * SCROLL_STEP_PX;
         }
-        if steps != 0 {
-            player.set_volume(player.volume() + 0.05 * steps as f32);
-            crate::settings::save_volume(player.volume());
+        if steps == 0 || !self.controls {
+            return;
+        }
+        if self.over_panel(size.0) {
+            let max = self.songs.saturating_sub(Self::panel_rows(size.1));
+            self.panel_scroll = (self.panel_scroll as i32 - steps).clamp(0, max as i32) as usize;
+            return;
+        }
+        if let Some((t, v)) = transport.and_then(|t| Some((t, t.volume()?))) {
+            t.set_volume(v + 0.05 * steps as f32);
+            crate::settings::save_volume(t.volume().unwrap_or(v));
             self.vol_shown = now;
         }
     }
 
-    /// Per-frame bookkeeping: timeline fade, cursor hiding, live seeking.
-    pub fn update(&mut self, now: f64, dt: f32, window: &Window, player: &mut Player, size: (f32, f32)) {
-        let (w, _) = size;
+    /// Per-frame bookkeeping: timeline and playlist fade, cursor hiding,
+    /// live seeking. `songs`/`current`: the playlist (0 songs: none).
+    pub fn update(&mut self, now: f64, dt: f32, window: &Window, transport: Option<&mut dyn Transport>, size: (f32, f32), songs: usize, current: usize) {
+        let (w, h) = size;
         let recent = now - self.last_move < IDLE;
         let seeking = self.drag == Drag::Seek;
+        let over_panel = self.over_panel(w);
         // The timeline shows whenever the cursor is visible over the window.
-        let target = if (self.mouse_in && recent) || seeking { 1.0 } else { 0.0 };
+        let target = if self.controls && ((self.mouse_in && recent) || seeking || over_panel) { 1.0 } else { 0.0 };
         self.bar_alpha += (target - self.bar_alpha) * (dt * 12.0).min(1.0);
 
-        let want_cursor = recent || self.drag != Drag::None || !self.mouse_in;
+        // The playlist: at the right edge, while over it, or pinned.
+        if (songs, current) != (self.songs, self.current) || self.panel_alpha < 0.02 {
+            // Opening (or the song changed): show the current song.
+            let rows = Self::panel_rows(h);
+            if current < self.panel_scroll || current >= self.panel_scroll + rows || self.panel_alpha < 0.02 {
+                self.panel_scroll = current.saturating_sub(rows / 3).min(songs.saturating_sub(rows));
+            }
+        }
+        self.songs = songs;
+        self.current = current;
+        let at_edge = self.mouse_in && recent && self.mouse.0 > w - PANEL_EDGE && self.mouse.1 < h - ZONE;
+        let show = self.controls && songs > 0 && (self.panel_pinned || at_edge || over_panel);
+        let target = if show { 1.0 } else { 0.0 };
+        self.panel_alpha += (target - self.panel_alpha) * (dt * 12.0).min(1.0);
+
+        let want_cursor = !self.controls || recent || over_panel || self.drag != Drag::None || !self.mouse_in;
         if want_cursor != self.cursor_visible {
             window.set_cursor_visible(want_cursor);
             self.cursor_visible = want_cursor;
         }
         if seeking {
-            player.scrub(Self::time_at(self.mouse.0, w, player.duration()));
+            if let Some(t) = transport {
+                if let Some(d) = t.duration() {
+                    t.scrub(Self::time_at(self.mouse.0, w, d));
+                }
+            }
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn draw(
-        &self,
-        ui: &mut Batch,
-        texts: &mut Vec<Text>,
-        measure: &mut dyn FnMut(&str, f32) -> f32,
-        player: &Player,
-        waveform: &[(f32, f32)],
-        expected: usize,
-        now: f64,
-        size: (f32, f32),
-    ) {
+    pub fn draw(&self, ui: &mut Batch, texts: &mut Vec<Text>, measure: &mut dyn FnMut(&str, f32) -> f32, s: &Status, now: f64, size: (f32, f32)) {
         let (w, h) = size;
-        let mut text = |s: String, x: f32, y: f32, size: f32, color: Rgba| texts.push(Text { text: s, x, y, size, color });
+        let mut text = |t: String, x: f32, y: f32, size: f32, color: Rgba| texts.push(Text { text: t, x, y, size, color });
+
+        if let Some(pl) = s.playlist.as_ref().filter(|_| self.panel_alpha > 0.01) {
+            self.draw_playlist(ui, &mut text, measure, pl, size);
+        }
 
         let a = self.bar_alpha;
         if a > 0.01 {
             // Soft shade behind the controls.
-            // One smooth gradient (stacked strips overlapped into dark lines).
             ui.gradient_v(0.0, h - SHADE, w, SHADE, [0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.6 * a]);
 
-            let dur = player.duration();
-            let cur = player.position() / player.rate as f64;
             let mid = h - 12.0 - WAVE_H / 2.0;
             let bar_w = w - 2.0 * PAD;
-            let played_x = PAD + bar_w * (cur / dur) as f32;
+            let played_x = s.time.map(|(cur, dur)| PAD + bar_w * (cur / dur.max(1e-9)) as f32);
 
             // Waveform: one 2 px column every 3 px, mirrored around the centre line.
             // Bright = played, dim = still to come; outer part = peak, inner = loudness.
             let step = 3.0;
             let cols = (bar_w / step) as usize;
-            // `expected` buckets make up the whole song; while it is still being
-            // decoded, only the first `waveform.len()` exist yet (it fills in).
-            let n = expected.max(waveform.len()).max(1);
+            let n = s.expected.max(s.waveform.len()).max(1);
+            // Live input is right-aligned: its newest bucket at the right edge.
+            let offset = if s.time.is_none() { n - s.waveform.len() } else { 0 };
             for c in 0..cols {
                 let x = PAD + c as f32 * step;
                 let b0 = ((x - PAD) / bar_w * n as f32) as usize;
-                if b0 >= waveform.len() {
+                let b1 = (((x + step - PAD) / bar_w * n as f32) as usize).max(b0 + 1);
+                let (Some(b0), b1) = (b0.checked_sub(offset), b1.saturating_sub(offset)) else { continue };
+                if b0 >= s.waveform.len() {
                     break;
                 }
-                let b1 = (((x + step - PAD) / bar_w * n as f32) as usize).clamp(b0 + 1, waveform.len());
-                let (peak, rms) = waveform[b0..b1].iter().fold((0.0f32, 0.0f32), |acc, v| (acc.0.max(v.0), acc.1.max(v.1)));
-                let played = x + 1.0 < played_x;
-                let (pa, ra) = if played { (0.35, 0.9) } else { (0.12, 0.3) };
+                let b1 = b1.clamp(b0 + 1, s.waveform.len());
+                let (peak, rms) = s.waveform[b0..b1].iter().fold((0.0f32, 0.0f32), |acc, v| (acc.0.max(v.0), acc.1.max(v.1)));
+                let (pa, ra) = match played_x {
+                    Some(px) if x + 1.0 < px => (0.35, 0.9),
+                    Some(_) => (0.12, 0.3),
+                    // Live: older is dimmer.
+                    None => {
+                        let t = 0.4 + 0.6 * (x - PAD) / bar_w;
+                        (0.35 * t, 0.9 * t)
+                    }
+                };
                 let ph = (peak * WAVE_H / 2.0).max(0.5);
                 let rh = (rms * WAVE_H / 2.0 * 1.4).min(ph).max(0.5);
                 ui.rect(x, mid - ph, 2.0, ph * 2.0, white(pa * a));
                 ui.rect(x, mid - rh, 2.0, rh * 2.0, white(ra * a));
             }
-            ui.rect(played_x - 1.0, mid - WAVE_H / 2.0 - 3.0, 2.0, WAVE_H + 6.0, white(0.95 * a));
-
-            let label_y = mid - WAVE_H / 2.0 - 30.0;
-
-            // The song's name above the time, shortened with "…" if too long.
-            let max_w = w - 2.0 * PAD;
-            let mut title = self.title.clone();
-            if measure(&title, 18.0) > max_w {
-                while !title.is_empty() && measure(&format!("{title}…"), 18.0) > max_w {
-                    title.pop();
-                }
-                title = format!("{}…", title.trim_end());
-            }
-            text(title, PAD, label_y - 26.0, 18.0, white(0.92 * a));
-            text(format!("{} / {}", fmt_time(cur), fmt_time(dur)), PAD, label_y, 15.0, white(0.8 * a));
-            if player.paused() {
-                let tw = measure("paused", 15.0);
-                text("paused".into(), w - PAD - tw, label_y, 15.0, white(0.5 * a));
+            if let Some(px) = played_x {
+                ui.rect(px - 1.0, mid - WAVE_H / 2.0 - 3.0, 2.0, WAVE_H + 6.0, white(0.95 * a));
             }
 
-            if self.in_zone(h) && self.drag != Drag::Seek {
+            // One line: title (and subtitle) on the left; time or "live" on
+            // the right, with a pause mark beside it while paused.
+            let title_y = h - 88.0;
+            let small_y = title_y + 3.5;
+            let right = match s.time {
+                Some((cur, dur)) => format!("{} / {}", fmt_time(cur), fmt_time(dur)),
+                None => "live".into(),
+            };
+            let rw = measure(&right, 15.0);
+            let rx = w - PAD - rw;
+            text(right, rx, small_y, 15.0, white(0.8 * a));
+            let mark_cy = small_y + 15.0 * 1.3 / 2.0;
+            let mut left_of_right = rx;
+            if s.paused {
+                let bx = rx - 10.0 - 7.0;
+                ui.rect(bx, mark_cy - 6.0, 2.0, 12.0, white(0.8 * a));
+                ui.rect(bx + 5.0, mark_cy - 6.0, 2.0, 12.0, white(0.8 * a));
+                left_of_right = bx;
+            } else if s.time.is_none() {
+                // Live and running: a softly pulsing dot.
+                let pulse = 0.35 + 0.65 * (0.5 + 0.5 * (now * std::f64::consts::PI).sin() as f32);
+                ui.glow(rx - 12.0, mark_cy, 6.0, 6.0, white(pulse * a));
+                left_of_right = rx - 18.0;
+            }
+            let room = left_of_right - PAD - 24.0;
+            let tw = measure(s.title, 18.0);
+            let sw = if s.subtitle.is_empty() { 0.0 } else { measure(s.subtitle, 15.0) };
+            if !s.subtitle.is_empty() && tw + 12.0 + sw <= room {
+                text(s.title.to_string(), PAD, title_y, 18.0, white(0.92 * a));
+                text(s.subtitle.to_string(), PAD + tw + 12.0, small_y, 15.0, white(0.5 * a));
+            } else {
+                text(fit(s.title, 18.0, room, measure), PAD, title_y, 18.0, white(0.92 * a));
+            }
+
+            // Where a click would seek to, just above the waveform.
+            if let Some((_, dur)) = s.time.filter(|_| self.in_zone(h) && self.drag != Drag::Seek && !self.over_panel(w)) {
                 let x = self.mouse.0.clamp(PAD, w - PAD);
                 ui.rect(x - 0.5, mid - WAVE_H / 2.0, 1.0, WAVE_H, white(0.6 * a));
                 let tip = fmt_time(Self::time_at(x, w, dur));
-                let tw = measure(&tip, 14.0);
-                let tx = (x - tw / 2.0).min(w - PAD - tw - 60.0).max(PAD + 90.0);
-                text(tip, tx, label_y + 1.0, 14.0, white(0.9 * a));
+                let tw = measure(&tip, 13.0);
+                let tx = (x - tw / 2.0).clamp(PAD, w - PAD - tw);
+                text(tip, tx, mid - WAVE_H / 2.0 - 19.0, 13.0, white(0.9 * a));
             }
         }
 
         let fade = |since: f64| (1.0 - ((now - since - 1.2) / 0.5) as f32).clamp(0.0, 1.0);
         let va = fade(self.vol_shown);
-        if va > 0.0 {
-            let v = player.volume();
+        if let Some(v) = s.volume.filter(|_| va > 0.0) {
             let label = format!("Volume {:.0}%", v * 100.0);
             let tw = measure(&label, 15.0);
             text(label, w - PAD - tw, PAD - 4.0, 15.0, white(0.85 * va));
             ui.rect(w - PAD - 100.0, PAD + 20.0, 100.0, 2.0, white(0.2 * va));
             ui.rect(w - PAD - 100.0, PAD + 20.0, 100.0 * v, 2.0, white(0.85 * va));
+        }
+    }
+
+    fn draw_playlist(&self, ui: &mut Batch, text: &mut dyn FnMut(String, f32, f32, f32, Rgba), measure: &mut dyn FnMut(&str, f32) -> f32, pl: &PlaylistView, size: (f32, f32)) {
+        let (w, h) = size;
+        let a = self.panel_alpha;
+        // Shade from the right edge, like the one behind the timeline.
+        let solid = PANEL_SHADE * 0.55;
+        ui.gradient_h(w - PANEL_SHADE, 0.0, PANEL_SHADE - solid, h, [0.0; 4], [0.0, 0.0, 0.0, 0.62 * a]);
+        ui.rect(w - solid, 0.0, solid, h, [0.0, 0.0, 0.0, 0.62 * a]);
+
+        let x0 = Self::panel_x(w);
+        let inner = x0 + 18.0;
+        text(fit(pl.name, 18.0, PANEL_W - 18.0, measure), inner, PANEL_TOP, 18.0, white(0.92 * a));
+        let count = format!("{} song{}", pl.songs.len(), if pl.songs.len() == 1 { "" } else { "s" });
+        let sub = if pl.lengths.iter().all(Option::is_some) {
+            format!("{count} · {}", fmt_time(pl.lengths.iter().flatten().sum()))
+        } else {
+            count
+        };
+        text(sub, inner, PANEL_TOP + 26.0, 13.0, white(0.45 * a));
+
+        let hover = self.panel_hit(size);
+        let rows = Self::panel_rows(h);
+        for (row, i) in (self.panel_scroll..pl.songs.len()).take(rows).enumerate() {
+            let y = ROWS_TOP + row as f32 * ROW_H;
+            let cur = i == pl.current;
+            let lit = cur || hover == Some(i);
+            let ta = if lit { 0.95 } else if i < pl.current { 0.4 } else { 0.55 };
+            let (na, da) = if cur { (0.7, 0.7) } else { (0.32, 0.38) };
+            if cur {
+                ui.rect(x0, y + 7.0, 2.0, 22.0, white(0.95 * a));
+            }
+            let ty = y + (ROW_H - 15.0 * 1.3) / 2.0;
+            let sy = y + (ROW_H - 13.0 * 1.3) / 2.0;
+            let n = format!("{}", i + 1);
+            text(n.clone(), inner + 20.0 - measure(&n, 13.0), sy, 13.0, white(na * a));
+            let len = pl.lengths.get(i).copied().flatten().map(fmt_time).unwrap_or_default();
+            let lw = if len.is_empty() { 0.0 } else { measure(&len, 13.0) };
+            if !len.is_empty() {
+                text(len, x0 + PANEL_W - lw, sy, 13.0, white(da * a));
+            }
+            let tx = inner + 34.0;
+            let title = fit(&pl.songs[i], 15.0, x0 + PANEL_W - lw - 14.0 - tx, measure);
+            text(title, tx, ty, 15.0, white(ta * a));
         }
     }
 }
@@ -260,7 +520,7 @@ pub fn toggle_fullscreen(window: &Window) {
     window.focus_window();
 }
 
-fn fmt_time(secs: f64) -> String {
+pub fn fmt_time(secs: f64) -> String {
     let s = secs.max(0.0) as u64;
     if s >= 3600 {
         format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)

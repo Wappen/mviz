@@ -15,7 +15,7 @@
 
 use super::draw_background;
 use crate::analysis::Timeline;
-use crate::audio::Track;
+use crate::audio::Samples;
 use crate::dsp::Fft;
 use crate::gfx::{Batch, PhosphorFrame};
 use crate::params;
@@ -163,6 +163,9 @@ pub struct Stereo {
     provisional: f32,
     /// How much of the bass background is shown (fades in once analysed).
     background: f32,
+    /// Live input: there is no audio after `frame` yet, so every window
+    /// ends there instead of being centred on it.
+    pub causal: bool,
 }
 
 impl Stereo {
@@ -203,15 +206,16 @@ impl Stereo {
             reference: 0.0,
             provisional: 0.0,
             background: 0.0,
+            causal: false,
             bands,
         }
     }
 
     /// Analyses the audio centred on `frame` and updates every band and bin.
-    fn update(&mut self, track: &Track, frame: f64, dt: f32, analysed_reference: Option<f32>) {
+    fn update(&mut self, track: &dyn Samples, frame: f64, dt: f32, analysed_reference: Option<f32>) {
         let centre = frame as i64;
         for (fft, spec) in self.ffts.iter_mut().zip(&mut self.spec) {
-            let start = centre - fft.n as i64 / 2;
+            let start = if self.causal { centre - fft.n as i64 } else { centre - fft.n as i64 / 2 };
             for ch in 0..2 {
                 // The song loops, so (once decoded) the audio before 0:00 is its end.
                 let out = fft.run(|j| track.sample(start + j as i64, ch));
@@ -270,7 +274,7 @@ impl Stereo {
     /// the phosphor (none while paused) into the returned frame.
     #[allow(clippy::too_many_arguments)]
     /// `tl` is the full analysis once it has finished (`None` before).
-    pub fn draw(&mut self, background: &mut Batch, track: &Track, rate: u32, frame: f64, dt: f32, tl: Option<&Timeline>, w: f32, h: f32) -> PhosphorFrame {
+    pub fn draw(&mut self, background: &mut Batch, track: &dyn Samples, rate: u32, frame: f64, dt: f32, tl: Option<&Timeline>, w: f32, h: f32) -> PhosphorFrame {
         // Paused (same frame): nothing changes, and the phosphor holds still.
         let advance = (frame != self.last_frame).then(|| {
             let dt = dt.min(0.1);

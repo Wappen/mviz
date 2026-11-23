@@ -25,6 +25,8 @@ pub enum Command {
     /// Go to this position (seconds).
     SeekTo(f64),
     Volume(f32),
+    Next,
+    Previous,
     Raise,
     Quit,
 }
@@ -86,8 +88,11 @@ impl Mpris {
                 let mut pool = futures::executor::LocalPool::new();
                 let spawner = pool.spawner();
                 pool.run_until(async move {
-                    // One name per process, so several open songs can coexist.
-                    let bus_name = format!("mviz.instance{}", std::process::id());
+                    // One name per process (and per start, as the previous
+                    // one may still be releasing it), so several can coexist.
+                    static STARTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    let n = STARTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let bus_name = format!("mviz.instance{}_{n}", std::process::id());
                     let player = match Player::builder(&bus_name)
                         .identity("mviz")
                         .desktop_entry("mviz")
@@ -96,8 +101,8 @@ impl Mpris {
                         .can_seek(true)
                         .can_raise(true)
                         .can_quit(true)
-                        .can_go_next(false)
-                        .can_go_previous(false)
+                        .can_go_next(true)
+                        .can_go_previous(true)
                         .loop_status(LoopStatus::Track)
                         .playback_status(PlaybackStatus::Playing)
                         .volume(volume as f64)
@@ -125,6 +130,8 @@ impl Mpris {
                     on!(connect_pause, Command::Pause);
                     on!(connect_stop, Command::Stop);
                     on!(connect_raise, Command::Raise);
+                    on!(connect_next, Command::Next);
+                    on!(connect_previous, Command::Previous);
                     on!(connect_quit, Command::Quit);
                     let tx = cmd_tx.clone();
                     player.connect_seek(move |_, offset| {

@@ -28,6 +28,35 @@ const MAX_CHUNKS: usize = 1 << 14;
 /// Frames per waveform bucket (the timeline overview).
 const WAVE_FRAMES: usize = 1024;
 
+/// Stereo audio the visuals can read at any (signed) frame index: a song,
+/// or the live capture buffer. Frames that don't exist read as silence.
+pub trait Samples {
+    fn sample(&self, i: i64, ch: usize) -> f32;
+}
+
+impl<T: Samples + ?Sized> Samples for Arc<T> {
+    #[inline]
+    fn sample(&self, i: i64, ch: usize) -> f32 {
+        (**self).sample(i, ch)
+    }
+}
+
+impl Samples for Track {
+    #[inline]
+    fn sample(&self, i: i64, ch: usize) -> f32 {
+        Track::sample(self, i, ch)
+    }
+}
+
+/// The output device. Pinned to ALSA (which reaches PipeWire / PulseAudio
+/// through their ALSA plugins): the PulseAudio host is compiled in for
+/// capture only, and playback timing is tuned for ALSA.
+fn output_device() -> Option<cpal::Device> {
+    cpal::host_from_id(cpal::HostId::Alsa)
+        .unwrap_or_else(|_| cpal::default_host())
+        .default_output_device()
+}
+
 /// A song's interleaved stereo samples, filled while it is already in use.
 /// One writer (the decoder) publishes complete chunks; any number of readers
 /// (audio callback, visuals, analysis) see only published data.
@@ -363,8 +392,7 @@ pub fn load(path: &Path) -> Result<Arc<Track>, String> {
 
 /// Picks an output config, preferring the song's own sample rate (no resampling).
 pub fn pick_config(file_rate: u32) -> Result<(StreamConfig, SampleFormat), String> {
-    let host = cpal::default_host();
-    let device = host.default_output_device().ok_or("no audio output device")?;
+    let device = output_device().ok_or("no audio output device")?;
     let default = device.default_output_config().map_err(|e| format!("no output config: {e}"))?;
     let mut best: Option<(i32, cpal::SupportedStreamConfig)> = None;
     if let Ok(configs) = device.supported_output_configs() {
@@ -409,6 +437,11 @@ struct Shared {
     scrub: AtomicBool,
     volume: AtomicU32,
     seek: AtomicU64,
+    /// The song to continue with at the end of this one (gapless), instead
+    /// of looping. Taken by the callback (with `try_lock`: it never waits).
+    next: Mutex<Option<Arc<Track>>>,
+    /// Counts the callback's switches to a queued song.
+    switches: AtomicU64,
 }
 
 pub struct Player {
@@ -421,6 +454,9 @@ pub struct Player {
     frozen: Option<f64>,
     /// While the timeline is dragged the visuals show this frame.
     preview: Option<f64>,
+    /// The queued next song (also in `shared.next` until the callback takes it).
+    queued: Option<Arc<Track>>,
+    switches_seen: u64,
 }
 
 impl Player {
@@ -435,9 +471,11 @@ impl Player {
             scrub: AtomicBool::new(false),
             volume: AtomicU32::new(volume.clamp(0.0, 1.0).to_bits()),
             seek: AtomicU64::new(NO_SEEK),
+            next: Mutex::new(None),
+            switches: AtomicU64::new(0),
         });
         let epoch = Instant::now();
-        let device = cpal::default_host().default_output_device().ok_or("no audio output device")?;
+        let device = output_device().ok_or("no audio output device")?;
         let build = |config: StreamConfig| -> Result<cpal::Stream, cpal::Error> {
             let (t, sh) = (track.clone(), shared.clone());
             match format {
@@ -454,7 +492,39 @@ impl Player {
                 .map_err(|e| format!("cannot open audio stream: {e}"))?,
         };
         stream.play().map_err(|e| format!("cannot start audio: {e}"))?;
-        Ok(Self { _stream: stream, shared, epoch, rate: config.sample_rate, track, frozen: None, preview: None })
+        Ok(Self {
+            _stream: stream,
+            shared,
+            epoch,
+            rate: config.sample_rate,
+            track,
+            frozen: None,
+            preview: None,
+            queued: None,
+            switches_seen: 0,
+        })
+    }
+
+    /// Plays `track` (decoded at this player's rate) after the current song
+    /// ends, without a gap, instead of looping.
+    pub fn queue(&mut self, track: Arc<Track>) {
+        *self.shared.next.lock().unwrap() = Some(track.clone());
+        self.queued = Some(track);
+    }
+
+    /// Checks whether playback has moved on to the queued song; if so it is
+    /// now `self.track`, and this returns true (once).
+    pub fn poll_switch(&mut self) -> bool {
+        let n = self.shared.switches.load(Acquire);
+        if n == self.switches_seen {
+            return false;
+        }
+        self.switches_seen = n;
+        if let Some(t) = self.queued.take() {
+            self.track = t;
+        }
+        self.preview = None;
+        true
     }
 
     /// The frame currently coming out of the speakers (fractional, within the track).
@@ -543,7 +613,7 @@ fn build<T: SizedSample + FromSample<f32>>(
     device: &cpal::Device,
     config: StreamConfig,
     shared: Arc<Shared>,
-    track: Arc<Track>,
+    mut track: Arc<Track>,
     epoch: Instant,
 ) -> Result<cpal::Stream, cpal::Error> {
     let ch = config.channels as usize;
@@ -558,7 +628,7 @@ fn build<T: SizedSample + FromSample<f32>>(
             if seek != NO_SEEK {
                 pending_seek = Some(seek);
             }
-            let total = track.total();
+            let mut total = track.total();
             let mut pos = shared.pos.load(Relaxed) as usize;
             if let Some(n) = total.filter(|&n| n > 0) {
                 pos %= n;
@@ -594,7 +664,14 @@ fn build<T: SizedSample + FromSample<f32>>(
                 let (l, r) = (l * gain, r * gain);
                 pos += 1;
                 if total.is_some_and(|n| pos >= n) {
-                    pos = 0; // gapless loop
+                    pos = 0; // gapless loop, or on to the queued song
+                    if let Ok(mut next) = shared.next.try_lock() {
+                        if let Some(t) = next.take() {
+                            track = t;
+                            total = track.total();
+                            shared.switches.fetch_add(1, Release);
+                        }
+                    }
                 }
                 if ch == 1 {
                     frame[0] = T::from_sample(0.5 * (l + r));
