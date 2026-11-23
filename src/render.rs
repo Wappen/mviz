@@ -99,3 +99,61 @@ pub fn run(args: &[OsString]) -> Result<(), String> {
     eprintln!("wrote {}", o.out.display());
     Ok(())
 }
+
+#[cfg(test)]
+mod preview {
+    use super::*;
+
+    fn save(gfx: &Gfx, w: u32, h: u32, path: &str) {
+        let rgba = gfx.read_frame();
+        let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+        for p in rgba.chunks_exact(4) {
+            out.extend_from_slice(&p[..3]);
+        }
+        std::fs::write(path, out).unwrap();
+    }
+
+    /// `MVIZ_OUT=dir [MVIZ_FILE=song] cargo test --release preview -- --ignored`
+    #[test]
+    #[ignore]
+    fn start_screen() {
+        let dir = std::env::var("MVIZ_OUT").unwrap();
+        let (w, h) = (1600u32, 1000u32);
+        let mut gfx = Gfx::new_offscreen(w, h);
+        let mut home = crate::home::Home::new();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        home.update(0.0);
+        for t in [0.0, 15.0, 30.0, 60.0] {
+            let mut scene = Scene { clear: modes::base(), blur: 1.0, ..Default::default() };
+            let mut measure = |s: &str, size: f32| gfx.text_width(s, size);
+            home.draw(&mut scene.ui, &mut scene.texts, Some(&mut scene.background), &mut measure, "mviz", false, 1.0, t, (w as f32, h as f32));
+            gfx.render(scene);
+            save(&gfx, w, h, &format!("{dir}/home_{t}.ppm"));
+        }
+        let Ok(song) = std::env::var("MVIZ_FILE") else { return };
+        let source = Source::open(std::path::Path::new(&song)).unwrap();
+        let rate = source.rate;
+        let track = source.track(rate);
+        source.decode_into(track.clone()).unwrap();
+        let tl = analysis::analyze(&track, &AtomicU32::new(0));
+        let mut stereo = Stereo::new(rate);
+        let dt = 1.0 / 60.0;
+        for i in 0..240 {
+            let t = 30.0 + i as f64 * dt;
+            let blur = if i == 239 { 1.0 } else { 0.0 };
+            let mut scene = Scene { clear: modes::base(), blur, ..Default::default() };
+            scene.phosphor = Some(stereo.draw(&mut scene.background, &track, rate, t * rate as f64, dt as f32, Some(&tl), w as f32, h as f32));
+            if i >= 238 {
+                if blur > 0.0 {
+                    scene.ui.rect(0.0, 0.0, w as f32, h as f32, [0.0, 0.0, 0.0, 0.5]);
+                    let mut measure = |s: &str, size: f32| gfx.text_width(s, size);
+                    home.draw(&mut scene.ui, &mut scene.texts, None, &mut measure, "Song", true, 1.0, t, (w as f32, h as f32));
+                }
+                gfx.render(scene);
+                save(&gfx, w, h, &format!("{dir}/song_{}.ppm", if blur > 0.0 { "menu" } else { "plain" }));
+            } else {
+                gfx.render(scene);
+            }
+        }
+    }
+}

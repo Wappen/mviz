@@ -4,9 +4,6 @@ use rustfft::{num_complex::Complex32, Fft as RFft, FftPlanner};
 use std::f32::consts::TAU;
 use std::sync::Arc;
 
-/// Magnitudes below this (about -80 dBFS) are treated as silence.
-pub const ABS_FLOOR: f32 = 1e-4;
-
 /// A reusable Hann-windowed forward FFT.
 pub struct Fft {
     pub n: usize,

@@ -36,7 +36,10 @@ mod ui;
 
 use audio::Player;
 use capture::Capture;
-use gfx::{Gfx, PhosphorFrame, Scene, Text};
+use gfx::{Gfx, Scene, Text};
+
+/// How far the start screen darkens the (blurred) picture behind it.
+const HOME_DIM: f32 = 0.5;
 use modes::stereo::Stereo;
 use playlist::Playlist;
 use std::path::{Path, PathBuf};
@@ -502,13 +505,13 @@ impl App {
             }
         } else {
             self.ui.update(now, dt, &window, None, (w, h), 0, 0);
-            // Nothing playing: the start screen's light drifts in the phosphor.
-            scene.phosphor = Some(PhosphorFrame { live: Default::default(), advance: Some(dt.min(0.1)) });
         }
-
         // Paused or start screen over the picture: dim it.
         let pause_dim = self.playing.as_ref().map_or(0.0, |p| 0.6 * p.dim);
-        let home_dim = if self.playing.is_some() { 0.72 * self.home_alpha } else { 0.0 };
+        // The start screen blurs what is behind it: the picture, or (started
+        // without a file) its own moving colour.
+        scene.blur = if self.playing.is_some() { self.home_alpha } else { 1.0 };
+        let home_dim = if self.playing.is_some() { HOME_DIM * self.home_alpha } else { 0.0 };
         let dim = pause_dim.max(home_dim);
         if dim > 0.005 {
             scene.ui.rect(0.0, 0.0, w, h, [0.0, 0.0, 0.0, dim]);
@@ -533,8 +536,8 @@ impl App {
 
         if self.home_alpha > 0.01 {
             let standalone = self.playing.is_none();
-            let glows = if standalone { scene.phosphor.as_mut().map(|p| &mut p.live) } else { None };
-            self.home.draw(&mut scene.ui, &mut scene.texts, glows, &mut measure, &home_title, !standalone, self.home_alpha, now, (w, h));
+            let backdrop = if standalone { Some(&mut scene.background) } else { None };
+            self.home.draw(&mut scene.ui, &mut scene.texts, backdrop, &mut measure, &home_title, !standalone, self.home_alpha, now, (w, h));
         }
 
         if let Some((msg, at)) = &self.notice {

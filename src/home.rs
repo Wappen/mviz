@@ -192,14 +192,14 @@ impl Home {
     }
 
     /// Draws the screen at strength `a`. `title`: "mviz", or what is
-    /// playing. `glows`: no picture behind (started without a file): soft
-    /// drifting light, into the phosphor layer. `overlay`: over the picture.
+    /// playing. `backdrop`: no picture behind (started without a file):
+    /// slowly moving colour, to be blurred. `overlay`: over the picture.
     #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &mut self,
         ui: &mut Batch,
         texts: &mut Vec<Text>,
-        glows: Option<&mut Batch>,
+        backdrop: Option<&mut Batch>,
         measure: &mut dyn FnMut(&str, f32) -> f32,
         title: &str,
         overlay: bool,
@@ -211,19 +211,8 @@ impl Home {
         let white = |al: f32| -> Rgba { [1.0, 1.0, 1.0, al * a] };
         let mut text = |t: String, x: f32, y: f32, size: f32, color: Rgba| texts.push(Text { text: t, x, y, size, color });
 
-        if let Some(g) = glows {
-            let t = now as f32;
-            let drift = |phase: f32| ((t / 9.0 + phase).sin() * 40.0, (t / 9.0 + phase).cos() * -24.0);
-            let lights: [(f32, f32, f32, f32, [f32; 3], f32); 4] = [
-                (0.30, 0.72, 0.17, 0.08, [0.47, 0.24, 0.78], 0.0),
-                (0.70, 0.23, 0.12, 0.06, [0.16, 0.67, 0.55], 2.0),
-                (0.79, 0.75, 0.10, 0.05, [0.86, 0.43, 0.24], 4.0),
-                (0.31, 0.19, 0.08, 0.04, [0.82, 0.27, 0.55], 1.0),
-            ];
-            for (cx, cy, rx, ry, c, phase) in lights {
-                let (dx, dy) = drift(phase);
-                g.glow(cx * w + dx, cy * h + dy, rx * w, ry * h * 1.6, [c[0], c[1], c[2], 0.22]);
-            }
+        if let Some(g) = backdrop {
+            draw_backdrop(g, now, w, h);
         }
 
         // Lay out: title, open rows, capture, recent.
@@ -327,5 +316,35 @@ fn home_relative(path: &std::path::Path) -> String {
     match std::env::var("HOME") {
         Ok(home) if !home.is_empty() && s.starts_with(&home) => format!("~{}", &s[home.len()..]),
         _ => s,
+    }
+}
+
+/// Large soft fields of colour, each wandering on its own slow loop and
+/// drifting between two hues, overlapping into one another. Drawn sharp-ish
+/// here; the renderer blurs them heavily into a smooth wash.
+fn draw_backdrop(g: &mut Batch, now: f64, w: f32, h: f32) {
+    // Centre (share of the window), loop size, radius (share of the larger
+    // side), the two colours it drifts between, and its periods (s).
+    type Field = ([f32; 2], [f32; 2], f32, [f32; 3], [f32; 3], [f32; 3]);
+    const FIELDS: [Field; 6] = [
+        ([0.15, 0.85], [0.18, 0.12], 0.75, [0.26, 0.10, 0.52], [0.10, 0.14, 0.50], [71.0, 53.0, 47.0]),
+        ([0.85, 0.15], [0.14, 0.16], 0.70, [0.04, 0.30, 0.36], [0.08, 0.20, 0.46], [59.0, 83.0, 61.0]),
+        ([0.90, 0.90], [0.12, 0.12], 0.60, [0.48, 0.16, 0.12], [0.42, 0.08, 0.26], [67.0, 43.0, 79.0]),
+        ([0.10, 0.15], [0.14, 0.16], 0.60, [0.40, 0.08, 0.32], [0.24, 0.08, 0.44], [89.0, 61.0, 53.0]),
+        ([0.50, 0.55], [0.24, 0.18], 0.55, [0.06, 0.08, 0.26], [0.14, 0.06, 0.26], [97.0, 73.0, 67.0]),
+        ([0.60, 0.00], [0.30, 0.08], 0.45, [0.30, 0.10, 0.36], [0.06, 0.28, 0.24], [79.0, 101.0, 89.0]),
+    ];
+    let t = now as f32;
+    let side = w.max(h);
+    let wave = |period: f32, phase: f32| (std::f32::consts::TAU * t / period + phase).sin();
+    for (i, (c, size, r, a, b, period)) in FIELDS.iter().enumerate() {
+        let phase = i as f32 * 1.7;
+        let x = (c[0] + size[0] * wave(period[0], phase)) * w;
+        let y = (c[1] + size[1] * wave(period[1], phase * 1.3 + 1.0)) * h;
+        let k = 0.5 + 0.5 * wave(period[2], phase * 0.7);
+        let col = [a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k, a[2] + (b[2] - a[2]) * k];
+        // Breathing in size, a little out of step with the wandering.
+        let rr = r * side * (1.0 + 0.12 * wave(period[1] * 0.9, phase + 2.0));
+        g.glow(x, y, rr, rr * 0.8, [col[0], col[1], col[2], 0.9]);
     }
 }

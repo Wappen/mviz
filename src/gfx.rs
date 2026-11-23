@@ -28,6 +28,8 @@ const FONT_FAMILY: &str = "Noto Sans";
 /// per frame (`fade_blur`) lets fading light spread out.
 /// The phosphor textures are this fraction of the window size (it is all soft glow).
 const PHOSPHOR_SCALE: f32 = 0.5;
+/// Most halvings of the picture when blurring.
+const BLUR_LEVELS: usize = 7;
 const PHOSPHOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 #[repr(C)]
@@ -129,6 +131,9 @@ pub struct Scene {
     /// Opaque layer (background).
     pub background: Batch,
     pub phosphor: Option<PhosphorFrame>,
+    /// How much the background and phosphor are blurred (0..1): behind the
+    /// start screen. The controls and text stay sharp.
+    pub blur: f32,
     /// Blended on top (controls).
     pub ui: Batch,
     pub texts: Vec<Text>,
@@ -146,6 +151,25 @@ struct Phosphor {
     update_bg: [[wgpu::BindGroup; 2]; 2],
     /// composite_bg[g][l]: shows glow g + live l.
     composite_bg: [[wgpu::BindGroup; 2]; 2],
+}
+
+/// Blurring: the picture drawn into `scene` (full size), then halved into
+/// `levels` and grown back (dual Kawase), each step spreading it further.
+struct Blur {
+    size: (u32, u32),
+    /// The picture, then each level's (half the size of the one before).
+    views: Vec<wgpu::TextureView>,
+    /// Reads view i (all three textures the same).
+    read: Vec<wgpu::BindGroup>,
+    /// The final pass: sharp picture and blurred (level 1).
+    present: wgpu::BindGroup,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct BlurParams {
+    amount: f32,
+    pad: [f32; 3],
 }
 
 #[repr(C)]
@@ -184,6 +208,14 @@ pub struct Gfx {
     /// Copies (and rescales) phosphor textures when the window is resized.
     copy_pipe: wgpu::RenderPipeline,
     phosphor: Option<Phosphor>,
+
+    blend_hdr_pipe: wgpu::RenderPipeline,
+    composite_hdr_pipe: wgpu::RenderPipeline,
+    down_pipe: wgpu::RenderPipeline,
+    up_pipe: wgpu::RenderPipeline,
+    present_pipe: wgpu::RenderPipeline,
+    blur_params: wgpu::Buffer,
+    blur: Option<Blur>,
 
     font_system: FontSystem,
     swash: SwashCache,
@@ -326,6 +358,7 @@ impl Gfx {
         };
         let blend_pipe = shape_pipe(format, wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING, "blend");
         let add_hdr_pipe = shape_pipe(PHOSPHOR_FORMAT, additive, "add hdr");
+        let blend_hdr_pipe = shape_pipe(PHOSPHOR_FORMAT, wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING, "blend hdr");
         let vcap = 64 * 1024;
         let vbuf = Self::vertex_buffer(&device, vcap);
 
@@ -380,13 +413,13 @@ impl Gfx {
             bind_group_layouts: &[Some(&fx_layout)],
             ..Default::default()
         });
-        let fx_pipe = |entry: &str, target: wgpu::TextureFormat, blend: Option<wgpu::BlendState>| {
+        let fx_pipe_in = |fx: &wgpu::ShaderModule, entry: &str, target: wgpu::TextureFormat, blend: Option<wgpu::BlendState>| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(entry),
                 layout: Some(&fx_pipe_layout),
-                vertex: wgpu::VertexState { module: &fx, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
+                vertex: wgpu::VertexState { module: fx, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
                 fragment: Some(wgpu::FragmentState {
-                    module: &fx,
+                    module: fx,
                     entry_point: Some(entry),
                     targets: &[Some(wgpu::ColorTargetState { format: target, blend, write_mask: wgpu::ColorWrites::ALL })],
                     compilation_options: Default::default(),
@@ -398,9 +431,26 @@ impl Gfx {
                 multiview_mask: None,
             })
         };
+        let fx_pipe = |entry: &str, target: wgpu::TextureFormat, blend: Option<wgpu::BlendState>| fx_pipe_in(&fx, entry, target, blend);
         let update_pipe = fx_pipe("update", PHOSPHOR_FORMAT, None);
         let composite_pipe = fx_pipe("composite", format, Some(additive));
         let copy_pipe = fx_pipe("copy", PHOSPHOR_FORMAT, None);
+        let composite_hdr_pipe = fx_pipe("composite", PHOSPHOR_FORMAT, Some(additive));
+
+        // --- blur ---
+        let blur_fx = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("blur"),
+            source: wgpu::ShaderSource::Wgsl(BLUR_WGSL.into()),
+        });
+        let down_pipe = fx_pipe_in(&blur_fx, "down", PHOSPHOR_FORMAT, None);
+        let up_pipe = fx_pipe_in(&blur_fx, "up", PHOSPHOR_FORMAT, None);
+        let present_pipe = fx_pipe_in(&blur_fx, "present", format, None);
+        let blur_params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("blur params"),
+            size: std::mem::size_of::<BlurParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         // --- text ---
         let font_system = FontSystem::new_with_fonts([glyphon::fontdb::Source::Binary(Arc::new(FONT_BYTES))]);
@@ -427,6 +477,13 @@ impl Gfx {
             composite_pipe,
             copy_pipe,
             phosphor: None,
+            blend_hdr_pipe,
+            composite_hdr_pipe,
+            down_pipe,
+            up_pipe,
+            present_pipe,
+            blur_params,
+            blur: None,
             font_system,
             swash: SwashCache::new(),
             viewport,
@@ -579,6 +636,53 @@ impl Gfx {
         self.phosphor = Some(Phosphor { size, live, glow, cur_live: 0, cur_glow: 0, update_bg, composite_bg });
     }
 
+    fn ensure_blur(&mut self) {
+        let size = (self.config.width, self.config.height);
+        if self.blur.as_ref().is_some_and(|b| b.size == size) {
+            return;
+        }
+        // Halve until the smallest level is about 16 px high (a blur about
+        // as wide as a sixth of the window), at most 7 times.
+        let mut dims = vec![size];
+        while dims.len() <= BLUR_LEVELS && dims.last().unwrap().1 > 32 {
+            let (w, h) = *dims.last().unwrap();
+            dims.push(((w / 2).max(1), (h / 2).max(1)));
+        }
+        let views: Vec<wgpu::TextureView> = dims
+            .iter()
+            .map(|&(w, h)| {
+                self.device
+                    .create_texture(&wgpu::TextureDescriptor {
+                        label: Some("blur"),
+                        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: PHOSPHOR_FORMAT,
+                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                        view_formats: &[],
+                    })
+                    .create_view(&Default::default())
+            })
+            .collect();
+        let bind = |a: &wgpu::TextureView, b: &wgpu::TextureView| {
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("blur"),
+                layout: &self.fx_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(a) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(b) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(b) },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                    wgpu::BindGroupEntry { binding: 4, resource: self.blur_params.as_entire_binding() },
+                ],
+            })
+        };
+        let read = views.iter().map(|v| bind(v, v)).collect();
+        let present = bind(&views[0], &views[1.min(views.len() - 1)]);
+        self.blur = Some(Blur { size, views, read, present });
+    }
+
     pub fn render(&mut self, scene: Scene) {
         let frame = match &mut self.output {
             Output::Offscreen { .. } => None,
@@ -680,14 +784,50 @@ impl Gfx {
             composite = Some((p.cur_glow, p.cur_live));
         }
 
-        {
-            let c = scene.clear;
-            let mut pass = begin(&mut encoder, &view, Some(wgpu::Color { r: c[0] as f64, g: c[1] as f64, b: c[2] as f64, a: 1.0 }));
-            draw_range(&mut pass, &self.blend_pipe, &self.globals_bg, &self.vbuf, ranges[0].clone());
-            if let (Some((g, l)), Some(p)) = (composite, &self.phosphor) {
-                pass.set_pipeline(&self.composite_pipe);
-                pass.set_bind_group(0, &p.composite_bg[g][l], &[]);
+        let c = scene.clear;
+        let clear = wgpu::Color { r: c[0] as f64, g: c[1] as f64, b: c[2] as f64, a: 1.0 };
+        let blurred = scene.blur > 0.002;
+        if blurred {
+            // The picture into a texture, halved step by step and grown back.
+            self.ensure_blur();
+            self.queue.write_buffer(&self.blur_params, 0, bytemuck::bytes_of(&BlurParams { amount: scene.blur.min(1.0), pad: [0.0; 3] }));
+            let b = self.blur.as_ref().unwrap();
+            {
+                let mut pass = begin(&mut encoder, &b.views[0], Some(clear));
+                draw_range(&mut pass, &self.blend_hdr_pipe, &self.globals_bg, &self.vbuf, ranges[0].clone());
+                if let (Some((g, l)), Some(p)) = (composite, &self.phosphor) {
+                    pass.set_pipeline(&self.composite_hdr_pipe);
+                    pass.set_bind_group(0, &p.composite_bg[g][l], &[]);
+                    pass.draw(0..3, 0..1);
+                }
+            }
+            let n = b.views.len();
+            for i in 1..n {
+                let mut pass = begin(&mut encoder, &b.views[i], None);
+                pass.set_pipeline(&self.down_pipe);
+                pass.set_bind_group(0, &b.read[i - 1], &[]);
                 pass.draw(0..3, 0..1);
+            }
+            for i in (1..n - 1).rev() {
+                let mut pass = begin(&mut encoder, &b.views[i], None);
+                pass.set_pipeline(&self.up_pipe);
+                pass.set_bind_group(0, &b.read[i + 1], &[]);
+                pass.draw(0..3, 0..1);
+            }
+        }
+        {
+            let mut pass = begin(&mut encoder, &view, Some(clear));
+            if let (true, Some(b)) = (blurred, &self.blur) {
+                pass.set_pipeline(&self.present_pipe);
+                pass.set_bind_group(0, &b.present, &[]);
+                pass.draw(0..3, 0..1);
+            } else {
+                draw_range(&mut pass, &self.blend_pipe, &self.globals_bg, &self.vbuf, ranges[0].clone());
+                if let (Some((g, l)), Some(p)) = (composite, &self.phosphor) {
+                    pass.set_pipeline(&self.composite_pipe);
+                    pass.set_bind_group(0, &p.composite_bg[g][l], &[]);
+                    pass.draw(0..3, 0..1);
+                }
             }
             draw_range(&mut pass, &self.blend_pipe, &self.globals_bg, &self.vbuf, ranges[2].clone());
             let _ = self.text_renderer.render(&self.atlas, &self.viewport, &mut pass);
@@ -829,5 +969,62 @@ fn composite(i: VOut) -> @location(0) vec4<f32> {
     let over = max(c - vec3<f32>(knee), vec3<f32>(0.0));
     let soft = vec3<f32>(knee) + (1.0 - knee) * (vec3<f32>(1.0) - exp(-over / (1.0 - knee)));
     return vec4<f32>(select(c, soft, c > vec3<f32>(knee)), 1.0);
+}
+"#;
+
+const BLUR_WGSL: &str = r#"
+struct Params { amount: f32, pad: f32, pad2: vec2<f32> };
+// down / up: the level read; present: the sharp picture
+@group(0) @binding(0) var src: texture_2d<f32>;
+// present: the blurred picture
+@group(0) @binding(1) var blurred: texture_2d<f32>;
+@group(0) @binding(3) var smp: sampler;
+@group(0) @binding(4) var<uniform> p: Params;
+
+struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> VOut {
+    let q = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    var o: VOut;
+    o.pos = vec4<f32>(q * 2.0 - 1.0, 0.0, 1.0);
+    o.uv = vec2<f32>(q.x, 1.0 - q.y);
+    return o;
+}
+
+// Dual Kawase: half the size, each pixel from five taps of the level above.
+@fragment
+fn down(i: VOut) -> @location(0) vec4<f32> {
+    let o = 1.0 / vec2<f32>(textureDimensions(src));
+    var c = textureSample(src, smp, i.uv).rgb * 4.0;
+    c += textureSample(src, smp, i.uv + vec2<f32>(-o.x, -o.y)).rgb;
+    c += textureSample(src, smp, i.uv + vec2<f32>(o.x, -o.y)).rgb;
+    c += textureSample(src, smp, i.uv + vec2<f32>(-o.x, o.y)).rgb;
+    c += textureSample(src, smp, i.uv + vec2<f32>(o.x, o.y)).rgb;
+    return vec4<f32>(c / 8.0, 1.0);
+}
+
+// ...and back up to twice the size, from eight taps around each pixel.
+@fragment
+fn up(i: VOut) -> @location(0) vec4<f32> {
+    let o = 1.0 / vec2<f32>(textureDimensions(src));
+    var c = textureSample(src, smp, i.uv + vec2<f32>(-2.0 * o.x, 0.0)).rgb;
+    c += textureSample(src, smp, i.uv + vec2<f32>(2.0 * o.x, 0.0)).rgb;
+    c += textureSample(src, smp, i.uv + vec2<f32>(0.0, -2.0 * o.y)).rgb;
+    c += textureSample(src, smp, i.uv + vec2<f32>(0.0, 2.0 * o.y)).rgb;
+    c += textureSample(src, smp, i.uv + vec2<f32>(-o.x, -o.y)).rgb * 2.0;
+    c += textureSample(src, smp, i.uv + vec2<f32>(o.x, -o.y)).rgb * 2.0;
+    c += textureSample(src, smp, i.uv + vec2<f32>(-o.x, o.y)).rgb * 2.0;
+    c += textureSample(src, smp, i.uv + vec2<f32>(o.x, o.y)).rgb * 2.0;
+    return vec4<f32>(c / 12.0, 1.0);
+}
+
+// The sharp picture blended into the blurred one by `amount`, with a
+// little noise (under one 8-bit step) so smooth dark gradients don't band.
+@fragment
+fn present(i: VOut) -> @location(0) vec4<f32> {
+    let c = mix(textureSample(src, smp, i.uv).rgb, textureSample(blurred, smp, i.uv).rgb, p.amount);
+    let n = fract(52.9829189 * fract(dot(i.pos.xy, vec2<f32>(0.06711056, 0.00583715))));
+    return vec4<f32>(c + (n - 0.5) / 255.0, 1.0);
 }
 "#;
