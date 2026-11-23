@@ -41,6 +41,8 @@ struct Vertex {
 
 const SOLID: u32 = 0;
 const GLOW: u32 = 1;
+/// A fade from clear to its colour along `uv.x`, eased (smoothstep).
+const FADE: u32 = 2;
 
 /// A list of shapes to draw in one go.
 #[derive(Default)]
@@ -72,16 +74,23 @@ impl Batch {
         self.gradient_h(x, y, w, h, c, c);
     }
 
-    /// Rectangle whose colour runs from `top` to `bottom`.
-    pub fn gradient_v(&mut self, x: f32, y: f32, w: f32, h: f32, top: Rgba, bottom: Rgba) {
-        let p = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]];
-        self.quad(p, [[0.0; 2]; 4], [top, top, bottom, bottom], SOLID);
-    }
-
     /// Rectangle whose colour runs from `left` to `right`.
     pub fn gradient_h(&mut self, x: f32, y: f32, w: f32, h: f32, left: Rgba, right: Rgba) {
         let p = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]];
         self.quad(p, [[0.0; 2]; 4], [left, right, right, left], SOLID);
+    }
+
+    /// From clear at the top to `c` at the bottom, eased at both ends (no
+    /// visible edge where it starts or where it meets solid colour).
+    pub fn fade_v(&mut self, x: f32, y: f32, w: f32, h: f32, c: Rgba) {
+        let p = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]];
+        self.quad(p, [[0.0, 0.0], [0.0, 0.0], [1.0, 0.0], [1.0, 0.0]], [c; 4], FADE);
+    }
+
+    /// From clear at the left to `c` at the right, eased like `fade_v`.
+    pub fn fade_h(&mut self, x: f32, y: f32, w: f32, h: f32, c: Rgba) {
+        let p = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]];
+        self.quad(p, [[0.0, 0.0], [1.0, 0.0], [1.0, 0.0], [0.0, 0.0]], [c; 4], FADE);
     }
 
     /// Soft round glow (gaussian-like falloff) with radii `rx`, `ry`.
@@ -760,6 +769,10 @@ fn fs(i: VOut) -> @location(0) vec4<f32> {
         // Soft glow: gaussian-like, reaching exactly 0 at the rim.
         let r2 = dot(i.uv, i.uv);
         a = select(0.0, exp(-r2 * 4.5) * (1.0 - r2), r2 < 1.0);
+    } else if (i.kind == 2u) {
+        // Eased fade: flat at both ends, so neither end shows as an edge.
+        let t = clamp(i.uv.x, 0.0, 1.0);
+        a = t * t * (3.0 - 2.0 * t);
     }
     let alpha = i.color.a * a;
     return vec4<f32>(i.color.rgb * alpha, alpha);

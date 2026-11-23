@@ -380,7 +380,7 @@ impl Ui {
         if a > 0.01 {
             // Soft shade behind the controls (lower for live input: no timeline).
             let shade = if s.time.is_some() { SHADE } else { SHADE * 0.6 };
-            ui.gradient_v(0.0, h - shade, w, shade, [0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.6 * a]);
+            ui.fade_v(0.0, h - shade, w, shade, [0.0, 0.0, 0.0, 0.6 * a]);
 
             let mid = h - 12.0 - WAVE_H / 2.0;
             let bar_w = w - 2.0 * PAD;
@@ -474,7 +474,7 @@ impl Ui {
         let a = self.panel_alpha;
         // Shade from the right edge, like the one behind the timeline.
         let solid = PANEL_SHADE * 0.55;
-        ui.gradient_h(w - PANEL_SHADE, 0.0, PANEL_SHADE - solid, h, [0.0; 4], [0.0, 0.0, 0.0, 0.62 * a]);
+        ui.fade_h(w - PANEL_SHADE, 0.0, PANEL_SHADE - solid, h, [0.0, 0.0, 0.0, 0.62 * a]);
         ui.rect(w - solid, 0.0, solid, h, [0.0, 0.0, 0.0, 0.62 * a]);
 
         let x0 = Self::panel_x(w);
