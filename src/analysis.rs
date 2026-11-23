@@ -6,7 +6,7 @@
 //! level for the field's brightness scale.
 
 use crate::audio::Track;
-use crate::dsp::{hz_to_midi, parabolic, percentile, Fft, ABS_FLOOR};
+use crate::dsp::{hz_to_midi, parabolic, percentile, Fft};
 use crate::modes::stereo;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
@@ -26,7 +26,7 @@ pub struct BassHit {
 pub struct Timeline {
     pub hop: f32,
     pub bass: Vec<BassHit>,
-    /// Low-passed (80 Hz, Q 0.5) amplitude per hop for (left, right), ~1.0 = loud.
+    /// Low-passed (80 Hz, Q 0.5) amplitude per hop for (left, right).
     pub bass_env: Vec<(f32, f32)>,
     /// Loud reference level for the stereo-field brightness scale.
     pub stereo_ref: f32,
@@ -162,8 +162,8 @@ pub(crate) const ENVELOPE_HZ: f64 = 10.0;
 /// barely does. Its power is then smoothed by a 10 Hz low-pass run forwards
 /// and backwards (no delay): that removes the ripple of each bass wave
 /// (twice its frequency: 60 Hz and up), which a short measuring window
-/// would turn into flicker, while keeping hits and swells. Normalised so the
-/// loud parts of the song sit near 1.0; one value per hop.
+/// would turn into flicker, while keeping hits and swells. One value per
+/// hop; scaled to the field's loudness reference when drawn.
 fn bass_envelope(track: &Track, rate: u32, n_hops: usize) -> Vec<(f32, f32)> {
     let n = track.total().unwrap_or(0);
     let blocks = n.div_ceil(ENV_BLOCK).max(1);
@@ -191,9 +191,7 @@ fn bass_envelope(track: &Track, rate: u32, n_hops: usize) -> Vec<(f32, f32)> {
             (p[0].max(0.0).sqrt() as f32, p[1].max(0.0).sqrt() as f32)
         })
         .collect();
-    let mut mono: Vec<f32> = rms.iter().map(|&(l, r)| ((l * l + r * r) / 2.0).sqrt()).collect();
-    let reference = percentile(&mut mono, 0.99).max(ABS_FLOOR);
-    rms.into_iter().map(|(l, r)| (l / reference, r / reference)).collect()
+    rms
 }
 
 /// Peak picking with a centred (look-ahead) adaptive threshold.
@@ -300,6 +298,40 @@ mod bass_glow {
             println!("{f} Hz: ripple {:.1} %", r * 100.0);
             assert!(r < 0.03, "{f} Hz: background ripples by {:.1} %", r * 100.0);
         }
+    }
+}
+
+#[cfg(test)]
+mod calibrate {
+    /// `MVIZ_DIR=~/Music cargo test --release calibrate -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bass_to_field() {
+        let dir = std::env::var("MVIZ_DIR").expect("set MVIZ_DIR");
+        let mut ratios = Vec::new();
+        let all: Vec<_> = walk(std::path::Path::new(&dir)).into_iter().filter(|p| std::fs::metadata(p).map_or(false, |m| m.len() > 1_500_000)).collect();
+        let step = (all.len() / 50).max(1);
+        for e in all.into_iter().step_by(step) {
+            let Ok(track) = crate::audio::load(&e) else { continue };
+            if track.length() < track.rate as usize * 60 { continue }
+            let tl = super::analyze(&track, &Default::default());
+            let mut mono: Vec<f32> = tl.bass_env.iter().map(|&(l, r)| ((l * l + r * r) / 2.0).sqrt()).collect();
+            let bass = crate::dsp::percentile(&mut mono, 0.99);
+            let r = bass / tl.stereo_ref.sqrt();
+            println!("{r:8.4}  bass {bass:.4}  field {:.6}  {}", tl.stereo_ref, e.file_name().unwrap().to_string_lossy());
+            ratios.push(r);
+        }
+        ratios.sort_by(f32::total_cmp);
+        println!("n {} median {:.4} p25 {:.4} p75 {:.4}", ratios.len(), ratios[ratios.len() / 2], ratios[ratios.len() / 4], ratios[3 * ratios.len() / 4]);
+    }
+
+    fn walk(d: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() { out.extend(walk(&p)) } else if crate::playlist::is_audio(&p) { out.push(p) }
+        }
+        out
     }
 }
 

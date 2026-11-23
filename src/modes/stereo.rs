@@ -28,6 +28,12 @@ pub(super) const F_LO: f32 = 30.0;
 /// hard edge.
 const BAND_HI: f32 = 20000.0;
 const PER_OCT: f32 = 30.0;
+/// Bass amplitude (80 Hz low-pass, see `analysis::bass_envelope`) that
+/// lights the background fully, per square root of the field's brightness
+/// reference: where a typical song's loud bass sits (measured over a music
+/// library: half the songs between 2.1 and 3.3). A bass-heavy mix lights
+/// the background more, a thin one less.
+const BASS_PER_FIELD: f32 = 2.8;
 
 /// How much a pitch is "carpet": 1 at the lowest pitch, shrinking gradually
 /// over the whole range and reaching 0 only at the top (with power 3:
@@ -279,31 +285,44 @@ impl Stereo {
     #[allow(clippy::too_many_arguments)]
     /// `tl` is the full analysis once it has finished (`None` before).
     pub fn draw(&mut self, background: &mut Batch, track: &dyn Samples, rate: u32, frame: f64, dt: f32, tl: Option<&Timeline>, w: f32, h: f32) -> PhosphorFrame {
-        // Paused (same frame): nothing changes, and the phosphor holds still.
-        let advance = (frame != self.last_frame).then(|| {
-            let dt = dt.min(0.1);
-            self.update(track, frame, dt, tl.map(|t| t.stereo_ref));
-            self.last_frame = frame;
-            dt
-        });
-        // The bass background: from the analysis (once it is there), or for
-        // live input measured as it arrives. Fade it in once it is there.
-        let bass = match tl {
-            Some(tl) => Some(Bass::at(tl, (frame / rate as f64) as f32)),
-            None if self.causal => {
-                let b = self.live_bass.get_or_insert_with(|| LiveBass::new(rate)).update(track, frame as i64, dt.min(0.1));
-                Some(Bass { pc: b.pc, level: b.level })
-            }
-            None => None,
-        };
-        if bass.is_some() {
-            self.background = (self.background + dt.min(0.1) / 0.6).min(1.0);
-        }
+        let (advance, bass) = self.step(track, rate, frame, dt, tl);
         let mut live = Batch::default();
         let tonality = if params::get().bg_noise_white > 0.0 { self.bass_tonality() } else { 1.0 };
         draw_background(background, &mut live, bass.as_ref(), tonality, self.background, w, h);
         super::field::draw(self, &mut live, w, h);
         PhosphorFrame { live, advance }
+    }
+}
+
+impl Stereo {
+    /// Analyses the audio at `frame` (unless paused there: then it returns
+    /// no advance) and measures the background's bass.
+    fn step(&mut self, track: &dyn Samples, rate: u32, frame: f64, dt: f32, tl: Option<&Timeline>) -> (Option<f32>, Option<Bass>) {
+        let dt = dt.min(0.1);
+        // Paused (same frame): nothing changes, and the phosphor holds still.
+        let advance = (frame != self.last_frame).then(|| {
+            self.update(track, frame, dt, tl.map(|t| t.stereo_ref));
+            self.last_frame = frame;
+            dt
+        });
+        // The bass background: from the analysis (once it is there), or for
+        // live input measured as it arrives. Both share the field's loudness
+        // reference, so the bass lights the background as brightly as it
+        // weighs in the whole mix. Fade it in once it is there.
+        let loud = BASS_PER_FIELD * self.reference.max(1e-9).sqrt();
+        let bass = match tl {
+            Some(tl) => Some(Bass::at(tl, (frame / rate as f64) as f32)),
+            None if self.causal => {
+                let b = self.live_bass.get_or_insert_with(|| LiveBass::new(rate)).update(track, frame as i64, dt, loud);
+                Some(Bass { pc: b.pc, level: b.level })
+            }
+            None => None,
+        }
+        .map(|b| Bass { pc: b.pc, level: (b.level.0 / loud, b.level.1 / loud) });
+        if bass.is_some() {
+            self.background = (self.background + dt / 0.6).min(1.0);
+        }
+        (advance, bass)
     }
 }
 
@@ -497,5 +516,46 @@ mod tests {
         assert_eq!(timing_weight(800.0), 0.0);
         let w = timing_weight(600.0);
         assert!(w > 0.3 && w < 0.7);
+    }
+
+    /// Compares the live background (measured as the audio arrives) with
+    /// the analysed one over a real song:
+    /// `MVIZ_FILE=song.mp3 cargo test --release live_matches_analysis -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_matches_analysis() {
+        let path = std::env::var("MVIZ_FILE").expect("set MVIZ_FILE");
+        let track = crate::audio::load(std::path::Path::new(&path)).unwrap();
+        let tl = crate::analysis::analyze(&track, &Default::default());
+        let rate = track.rate;
+        let secs = track.length() as f64 / rate as f64;
+        let (mut song, mut live) = (Stereo::new(rate), Stereo::new(rate));
+        live.causal = true;
+        let (mut same, mut notes, mut level_err, mut n) = (0, 0, 0.0f32, 0);
+        let mut f = 1;
+        while (f as f64) / 60.0 < secs {
+            let t = f as f64 / 60.0;
+            let frame = (t * rate as f64).floor();
+            let a = song.step(&track, rate, frame, 1.0 / 60.0, Some(&tl)).1.unwrap();
+            let b = live.step(&track, rate, frame, 1.0 / 60.0, None).1.unwrap();
+            if t > 20.0 {
+                if let (Some(x), Some(y)) = (b.pc, a.pc) {
+                    notes += 1;
+                    let d = (x - y).rem_euclid(12.0);
+                    if d.min(12.0 - d) < 0.5 {
+                        same += 1;
+                    }
+                }
+                // As the background sees it (capped at 1.2).
+                let c = |v: f32| v.clamp(0.0, 1.2);
+                level_err += (c(b.level.0) - c(a.level.0)).abs() + (c(b.level.1) - c(a.level.1)).abs();
+                n += 2;
+            }
+            if f % 600 == 0 {
+                println!("{t:6.1}s  live pc {:?} level ({:.2}, {:.2}) ref {:.5}  song pc {:?} level ({:.2}, {:.2}) ref {:.5}", b.pc.map(|p| p.round()), b.level.0, b.level.1, live.reference, a.pc.map(|p| p.round()), a.level.0, a.level.1, song.reference);
+            }
+            f += 1;
+        }
+        println!("same note {same} of {notes} frames ({:.0}%), mean level difference {:.3}", 100.0 * same as f32 / notes.max(1) as f32, level_err / n.max(1) as f32);
     }
 }

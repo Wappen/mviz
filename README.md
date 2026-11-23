@@ -38,8 +38,9 @@ You are sitting in front of the speakers:
   Moving sounds leave trails, and overlapping light adds up like light.
 - **Background:** the bass (below about 80 Hz) lights the background, each side
   with its own channel, tinted by the bass note (paler when the bass has no
-  clear pitch). Colour changes crossfade, and the glow fades out like the
-  rest. Live input measures this as it arrives, so its colour follows
+  clear pitch). It shares the field's loudness scale, so a bass-heavy mix
+  lights it more than a thin one. Colour changes crossfade, and the glow
+  fades out like the rest. Live input measures this as it arrives, so its colour follows
   the bass a moment behind.
 
 The light is computed live from the audio: each frame analyses the music at the

@@ -2,9 +2,8 @@
 //! (songs get it from the full analysis, `analysis::Timeline`).
 //!
 //! Level: the same 80 Hz low-pass and 10 Hz envelope as the song analysis,
-//! but run forwards only (no future to look at), and scaled by the loudest
-//! bass so far (slowly released), brought down to where a song's loud end
-//! would sit.
+//! but run forwards only (no future to look at). Like a song's, it is
+//! scaled to the field's loudness reference by `Stereo`.
 //!
 //! Note: every 0.05 s, the strongest bass frequency (30–160 Hz) in the last
 //! ~0.34 s. A new note takes over once it has been heard twice in a row, so
@@ -13,17 +12,12 @@
 use super::Bass;
 use crate::analysis::{LowPass, ENVELOPE_HZ, ENV_BLOCK};
 use crate::audio::Samples;
-use crate::dsp::{hz_to_midi, parabolic, Fft, ABS_FLOOR};
+use crate::dsp::{hz_to_midi, parabolic, Fft};
 
 const PITCH_N: usize = 16384;
 const PITCH_EVERY: f32 = 0.05;
-/// Bass quieter than this (relative to the reference) gives no note.
+/// Bass quieter than this (relative to loud bass) gives no note.
 const PITCH_MIN_LEVEL: f32 = 0.15;
-/// Seconds for the loudest-bass reference to fall back by 1/e.
-const REFERENCE_RELEASE: f32 = 20.0;
-/// The loud end of a song's bass (what a song's levels are scaled to)
-/// relative to its peak.
-const PEAK_TO_LOUD: f32 = 0.7;
 
 pub struct LiveBass {
     rate: u32,
@@ -36,7 +30,6 @@ pub struct LiveBass {
     power: [f64; 2],
     /// The next frame to read.
     next: Option<i64>,
-    reference: f32,
     fft: Fft,
     since_pitch: f32,
     /// The note shown, and the one heard last (with how often in a row).
@@ -60,7 +53,6 @@ impl LiveBass {
             n: 0,
             power: [0.0; 2],
             next: None,
-            reference: 0.0,
             fft: Fft::new(PITCH_N),
             since_pitch: PITCH_EVERY,
             pc: None,
@@ -69,8 +61,10 @@ impl LiveBass {
         }
     }
 
-    /// Reads the audio up to `frame` (the newest) and returns the bass now.
-    pub fn update(&mut self, s: &dyn Samples, frame: i64, dt: f32) -> &Bass {
+    /// Reads the audio up to `frame` (the newest) and returns the bass now
+    /// (amplitudes, as measured). `loud` is the amplitude of loud bass, below
+    /// which notes are not looked for.
+    pub fn update(&mut self, s: &dyn Samples, frame: i64, dt: f32, loud: f32) -> &Bass {
         // Held still (paused): nothing new.
         if self.next == Some(frame) {
             return &self.last;
@@ -98,12 +92,6 @@ impl LiveBass {
 
         let (l, r) = (self.power[0].max(0.0).sqrt() as f32, self.power[1].max(0.0).sqrt() as f32);
         let mono = ((l * l + r * r) / 2.0).sqrt();
-        // The loudest bass so far, slowly released.
-        self.reference = (self.reference * (-dt / REFERENCE_RELEASE).exp()).max(mono).max(ABS_FLOOR);
-        // A song's reference is its loud end (99th percentile), which sits
-        // below its very peak: scale to match.
-        let loud = self.reference * PEAK_TO_LOUD;
-        let level = (l / loud, r / loud);
 
         self.since_pitch += dt;
         if self.since_pitch >= PITCH_EVERY {
@@ -113,7 +101,7 @@ impl LiveBass {
                 self.hear(pc);
             }
         }
-        self.last = Bass { pc: self.pc, level };
+        self.last = Bass { pc: self.pc, level: (l, r) };
         &self.last
     }
 
@@ -168,7 +156,7 @@ mod tests {
         let frames = (secs * 60.0) as i64;
         let mut out = Bass { pc: None, level: (0.0, 0.0) };
         for f in 1..=frames {
-            let b = lb.update(s, f * rate / 60, 1.0 / 60.0);
+            let b = lb.update(s, f * rate / 60, 1.0 / 60.0, 0.2);
             out = Bass { pc: b.pc, level: b.level };
         }
         out
@@ -181,49 +169,10 @@ mod tests {
         let b = run(&mut lb, &Sine { hz: 110.0, rate: 48000.0, amp: 0.5, right: 0.5 }, 2.0);
         let pc = b.pc.expect("a note");
         assert!((pc - 9.0).abs() < 0.3, "pitch class {pc}");
-        // The steady sine is the peak itself: the louder side reads above
-        // 1 by the peak-to-loud scale.
-        let left = b.level.0 * PEAK_TO_LOUD;
-        assert!(left > 0.9 && left < 1.6, "left {}", b.level.0);
+        // The 80 Hz low-pass (Q 0.5) passes 1 / (1 + (110/80)²) ≈ 0.35 of
+        // 110 Hz: RMS ≈ 0.5 · 0.35 / √2.
+        assert!((b.level.0 - 0.122).abs() < 0.01, "left {}", b.level.0);
         assert!((b.level.1 / b.level.0 - 0.5).abs() < 0.05, "right / left {}", b.level.1 / b.level.0);
-    }
-
-    /// Compares the live bass with the full analysis over a real song:
-    /// `MVIZ_FILE=song.mp3 cargo test live_matches_analysis -- --ignored --nocapture`
-    #[test]
-    #[ignore]
-    fn live_matches_analysis() {
-        let path = std::env::var("MVIZ_FILE").expect("set MVIZ_FILE");
-        let track = crate::audio::load(std::path::Path::new(&path)).unwrap();
-        let tl = crate::analysis::analyze(&track, &Default::default());
-        let rate = track.rate as f64;
-        let secs = track.length() as f64 / rate;
-        let mut lb = LiveBass::new(track.rate);
-        let (mut same, mut notes, mut level_err, mut n) = (0, 0, 0.0f32, 0);
-        let mut f = 0;
-        while (f as f64) / 60.0 < secs {
-            let t = f as f32 / 60.0;
-            let live = lb.update(&track, (t as f64 * rate) as i64, 1.0 / 60.0);
-            let song = Bass::at(&tl, t);
-            if t > 20.0 {
-                if let (Some(a), Some(b)) = (live.pc, song.pc) {
-                    notes += 1;
-                    let d = (a - b).rem_euclid(12.0);
-                    if d.min(12.0 - d) < 0.5 {
-                        same += 1;
-                    }
-                }
-                // As the background sees it (capped at 1.2).
-                let c = |v: f32| v.clamp(0.0, 1.2);
-                level_err += (c(live.level.0) - c(song.level.0)).abs() + (c(live.level.1) - c(song.level.1)).abs();
-                n += 2;
-            }
-            if f % 600 == 0 {
-                println!("{t:6.1}s  live pc {:?} level ({:.2}, {:.2})  song pc {:?} level ({:.2}, {:.2})", live.pc.map(|p| p.round()), live.level.0, live.level.1, song.pc.map(|p| p.round()), song.level.0, song.level.1);
-            }
-            f += 1;
-        }
-        println!("same note {same} of {notes} frames ({:.0}%), mean level difference {:.3}", 100.0 * same as f32 / notes.max(1) as f32, level_err / n.max(1) as f32);
     }
 
     #[test]
@@ -235,6 +184,7 @@ mod tests {
         assert!((b.pc.unwrap() - 2.0).abs() < 0.3, "pitch class {:?}", b.pc);
         let b = run(&mut lb, &Sine { hz: 73.42, rate: 48000.0, amp: 0.0, right: 1.0 }, 1.0);
         assert!((b.pc.unwrap() - 2.0).abs() < 0.3);
-        assert!(b.level.0 < 0.05, "fades with the sound: {}", b.level.0);
+        assert!(b.level.0 < 0.01, "fades with the sound: {}", b.level.0);
     }
 }
+

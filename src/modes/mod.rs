@@ -20,7 +20,8 @@ fn bass_level(tl: &Timeline, t: f32) -> (f32, f32) {
 }
 
 /// What lights the background: the latest bass note's pitch class (`None`:
-/// none yet) and each channel's bass level (left, right; ~1.0 = loud).
+/// none yet) and each channel's bass level (left, right): an amplitude as
+/// measured, or (once scaled to the field's reference) ~1.0 = loud.
 /// From the full analysis for songs, measured as it arrives for live input.
 pub struct Bass {
     pub pc: Option<f32>,
