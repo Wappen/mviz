@@ -39,7 +39,8 @@ You are sitting in front of the speakers:
 - **Background:** the bass (below about 80 Hz) lights the background, each side
   with its own channel, tinted by the bass note (paler when the bass has no
   clear pitch). Colour changes crossfade, and the glow fades out like the
-  rest.
+  rest. Live input measures this as it arrives, so its colour follows
+  the bass a moment behind.
 
 The light is computed live from the audio: each frame analyses the music at the
 playback position with FFTs at three resolutions (long windows for the bass,

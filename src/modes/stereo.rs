@@ -13,7 +13,8 @@
 //! The glows are the live light and appear instantly; all fading happens in
 //! a phosphor texture on the GPU (see `gfx::FADE`).
 
-use super::draw_background;
+use super::live_bass::LiveBass;
+use super::{draw_background, Bass};
 use crate::analysis::Timeline;
 use crate::audio::Samples;
 use crate::dsp::Fft;
@@ -164,8 +165,10 @@ pub struct Stereo {
     /// How much of the bass background is shown (fades in once analysed).
     background: f32,
     /// Live input: there is no audio after `frame` yet, so every window
-    /// ends there instead of being centred on it.
+    /// ends there instead of being centred on it, and the background's bass
+    /// is measured as it arrives (`live_bass`) instead of analysed.
     pub causal: bool,
+    live_bass: Option<LiveBass>,
 }
 
 impl Stereo {
@@ -207,6 +210,7 @@ impl Stereo {
             provisional: 0.0,
             background: 0.0,
             causal: false,
+            live_bass: None,
             bands,
         }
     }
@@ -282,13 +286,22 @@ impl Stereo {
             self.last_frame = frame;
             dt
         });
-        // The bass background needs the analysis; fade it in once it is there.
-        if tl.is_some() {
+        // The bass background: from the analysis (once it is there), or for
+        // live input measured as it arrives. Fade it in once it is there.
+        let bass = match tl {
+            Some(tl) => Some(Bass::at(tl, (frame / rate as f64) as f32)),
+            None if self.causal => {
+                let b = self.live_bass.get_or_insert_with(|| LiveBass::new(rate)).update(track, frame as i64, dt.min(0.1));
+                Some(Bass { pc: b.pc, level: b.level })
+            }
+            None => None,
+        };
+        if bass.is_some() {
             self.background = (self.background + dt.min(0.1) / 0.6).min(1.0);
         }
         let mut live = Batch::default();
         let tonality = if params::get().bg_noise_white > 0.0 { self.bass_tonality() } else { 1.0 };
-        draw_background(background, &mut live, tl, (frame / rate as f64) as f32, tonality, self.background, w, h);
+        draw_background(background, &mut live, bass.as_ref(), tonality, self.background, w, h);
         super::field::draw(self, &mut live, w, h);
         PhosphorFrame { live, advance }
     }

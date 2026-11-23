@@ -120,7 +120,7 @@ pub fn analyze(track: &Track, progress: &AtomicU32) -> Timeline {
 }
 
 /// A 2nd-order low-pass (RBJ biquad) at `fc` for sample rate `rate`.
-struct LowPass {
+pub(crate) struct LowPass {
     b: [f64; 3],
     a: [f64; 2],
     x: [f64; 2],
@@ -128,7 +128,7 @@ struct LowPass {
 }
 
 impl LowPass {
-    fn new(fc: f64, q: f64, rate: f64) -> Self {
+    pub(crate) fn new(fc: f64, q: f64, rate: f64) -> Self {
         let w0 = std::f64::consts::TAU * fc / rate;
         let (cw, alpha) = (w0.cos(), w0.sin() / (2.0 * q));
         let a0 = 1.0 + alpha;
@@ -140,7 +140,7 @@ impl LowPass {
         }
     }
 
-    fn run(&mut self, x: f64) -> f64 {
+    pub(crate) fn run(&mut self, x: f64) -> f64 {
         let y = self.b[0] * x + self.b[1] * self.x[0] + self.b[2] * self.x[1] - self.a[0] * self.y[0] - self.a[1] * self.y[1];
         self.x = [x, self.x[0]];
         self.y = [y, self.y[0]];
@@ -150,11 +150,11 @@ impl LowPass {
 
 /// Samples per block when the bass power is reduced in rate (before the
 /// envelope filter, which only keeps changes below `ENVELOPE_HZ`).
-const ENV_BLOCK: usize = 32;
+pub(crate) const ENV_BLOCK: usize = 32;
 /// How fast the background may follow the bass. Must stay well below twice
 /// the lowest bass frequency (≈ 60 Hz), so the glow follows the bass's
 /// loudness, not its individual waves.
-const ENVELOPE_HZ: f64 = 10.0;
+pub(crate) const ENVELOPE_HZ: f64 = 10.0;
 
 /// Loudness of each channel's bass, for the background glow.
 /// The bass is a 2nd-order low-pass (80 Hz, Q 0.5): flat below 80 Hz,
