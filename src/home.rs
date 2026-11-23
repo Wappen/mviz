@@ -319,29 +319,91 @@ fn home_relative(path: &std::path::Path) -> String {
     }
 }
 
-/// Large soft fields of colour, each wandering on its own loop and
-/// drifting between two hues, overlapping into one another. Drawn sharp-ish
-/// here; the renderer blurs them heavily into a smooth wash.
+/// How the fields of colour move, all near the window's edges.
+#[derive(Clone, Copy)]
+pub(crate) enum Motion {
+    /// Round and round the edge, each at its own speed.
+    Orbit,
+    /// Each held near a corner, swaying along both of its edges.
+    Corners,
+    /// One per edge, sliding along it.
+    Edges,
+    /// One per edge, sliding along it and swelling in from it and back.
+    Tide,
+}
+
+const MOTION: Motion = Motion::Tide;
+
+/// A point on the window's edge: `s` (0..1) goes once round it clockwise
+/// from the top-left corner; `inset` is how far inwards (negative: outside).
+fn on_edge(s: f32, inset: f32, w: f32, h: f32) -> (f32, f32) {
+    let p = 2.0 * (w + h);
+    let d = s.rem_euclid(1.0) * p;
+    if d < w {
+        (d, inset)
+    } else if d < w + h {
+        (w - inset, d - w)
+    } else if d < 2.0 * w + h {
+        (w - (d - w - h), h - inset)
+    } else {
+        (inset, h - (d - 2.0 * w - h))
+    }
+}
+
+/// Large soft fields of colour near the window's edges, each drifting
+/// between two hues, overlapping into one another and leaving the middle
+/// dark. Drawn as soft glows; the renderer blurs them into a smooth wash.
 fn draw_backdrop(g: &mut Batch, now: f64, w: f32, h: f32) {
-    // Centre (share of the window), loop size, radius (share of the larger
-    // side), the two colours it drifts between, and its periods (s).
-    type Field = ([f32; 2], [f32; 2], f32, [f32; 3], [f32; 3], [f32; 3]);
+    draw_backdrop_as(g, now, w, h, MOTION);
+}
+
+pub(crate) fn draw_backdrop_as(g: &mut Batch, now: f64, w: f32, h: f32, motion: Motion) {
+    // Radius (share of the larger side), the two colours it drifts
+    // between, and its periods (s): along the edge, in and out, colour.
+    type Field = (f32, [f32; 3], [f32; 3], [f32; 3]);
     const FIELDS: [Field; 4] = [
-        ([0.25, 0.75], [0.28, 0.22], 0.62, [0.17, 0.06, 0.36], [0.05, 0.09, 0.32], [23.0, 17.0, 19.0]),
-        ([0.75, 0.25], [0.26, 0.24], 0.58, [0.02, 0.19, 0.23], [0.12, 0.06, 0.30], [19.0, 29.0, 23.0]),
-        ([0.80, 0.85], [0.22, 0.18], 0.48, [0.30, 0.09, 0.07], [0.26, 0.04, 0.17], [29.0, 13.0, 31.0]),
-        ([0.20, 0.15], [0.24, 0.20], 0.44, [0.24, 0.04, 0.20], [0.03, 0.16, 0.14], [17.0, 23.0, 13.0]),
+        (0.50, [0.17, 0.06, 0.36], [0.05, 0.09, 0.32], [23.0, 17.0, 19.0]),
+        (0.46, [0.02, 0.19, 0.23], [0.12, 0.06, 0.30], [19.0, 29.0, 23.0]),
+        (0.42, [0.30, 0.09, 0.07], [0.26, 0.04, 0.17], [29.0, 13.0, 31.0]),
+        (0.40, [0.24, 0.04, 0.20], [0.03, 0.16, 0.14], [17.0, 23.0, 13.0]),
     ];
     let t = now as f32;
     let side = w.max(h);
     let wave = |period: f32, phase: f32| (std::f32::consts::TAU * t / period + phase).sin();
-    for (i, (c, size, r, a, b, period)) in FIELDS.iter().enumerate() {
+    let perimeter = 2.0 * (w + h);
+    // Where each edge's middle and each corner sit along the way round.
+    let corners = [0.0, w / perimeter, (w + h) / perimeter, (2.0 * w + h) / perimeter];
+    let middles = [0.5 * w / perimeter, (w + 0.5 * h) / perimeter, (1.5 * w + h) / perimeter, (2.0 * w + 1.5 * h) / perimeter];
+    for (i, (r, a, b, period)) in FIELDS.iter().enumerate() {
         let phase = i as f32 * 1.7;
-        let x = (c[0] + size[0] * wave(period[0], phase)) * w;
-        let y = (c[1] + size[1] * wave(period[1], phase * 1.3 + 1.0)) * h;
         let k = 0.5 + 0.5 * wave(period[2], phase * 0.7);
         let col = [a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k, a[2] + (b[2] - a[2]) * k];
-        // Breathing in size, a little out of step with the wandering.
+        if let Motion::Tide = motion {
+            // Along its edge, a field is several overlapping lobes, each
+            // longer along the edge than deep, sliding and swelling out of
+            // step: its outline keeps changing instead of reading as a shape.
+            let horizontal = i % 2 == 0;
+            let length = if horizontal { w } else { h };
+            for j in 0..3 {
+                let lp = phase + j as f32 * 2.3;
+                let lperiod = period[0] * (0.8 + 0.25 * j as f32);
+                let s = middles[i] + (j as f32 - 1.0) * 0.05 + 0.07 * wave(lperiod, lp);
+                let inset = side * (-0.08 + 0.07 * (1.0 + wave(period[1] * (0.9 + 0.2 * j as f32), lp)));
+                let (x, y) = on_edge(s, inset, w, h);
+                let along = length * (0.5 + 0.12 * wave(lperiod * 1.3, lp + 1.0));
+                let deep = r * side * (0.7 + 0.2 * wave(period[1] * 0.7, lp + 2.0));
+                let (rx, ry) = if horizontal { (along, deep) } else { (deep, along) };
+                g.glow(x, y, rx, ry, [col[0], col[1], col[2], 0.55]);
+            }
+            continue;
+        }
+        let (s, inset) = match motion {
+            Motion::Orbit => (i as f32 / 4.0 + t / (period[0] * 3.0), 0.0),
+            Motion::Corners => (corners[i] + 0.09 * wave(period[0], phase), 0.04 * side * wave(period[1], phase)),
+            Motion::Edges | Motion::Tide => (middles[i] + 0.10 * wave(period[0], phase), 0.0),
+        };
+        let (x, y) = on_edge(s, inset, w, h);
+        // Breathing in size, a little out of step with the moving.
         let rr = r * side * (1.0 + 0.2 * wave(period[1] * 0.7, phase + 2.0));
         g.glow(x, y, rr, rr * 0.8, [col[0], col[1], col[2], 0.9]);
     }
