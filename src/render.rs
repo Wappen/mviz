@@ -118,7 +118,7 @@ mod preview {
     #[ignore]
     fn start_screen() {
         let dir = std::env::var("MVIZ_OUT").unwrap();
-        let (w, h) = (1600u32, 1000u32);
+        let (w, h) = std::env::var("MVIZ_SIZE").ok().and_then(|v| v.split_once('x').map(|(a, b)| (a.parse().unwrap(), b.parse().unwrap()))).unwrap_or((1600u32, 1000u32));
         let mut gfx = Gfx::new_offscreen(w, h);
         let mut home = crate::home::Home::new();
         std::thread::sleep(std::time::Duration::from_millis(500));

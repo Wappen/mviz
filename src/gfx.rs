@@ -961,9 +961,13 @@ fn soft(p0: vec2<f32>) -> f32 {
 fn corner_light(uv: vec2<f32>) -> vec3<f32> {
     let t = g.time;
     let aspect = g.size.x / max(g.size.y, 1.0);
-    let p = vec2<f32>(uv.x * aspect, uv.y);
-    let c1 = vec2<f32>(0.1 * aspect + 0.15 * sin(t * 0.05), 0.05 + 0.12 * cos(t * 0.04));
-    let c2 = vec2<f32>(0.9 * aspect + 0.15 * cos(t * 0.045), 0.95 + 0.12 * sin(t * 0.055));
+    // Measured in a unit from the window's area (its height at 16:10), so
+    // the pools keep their share of very wide or tall windows.
+    let k = sqrt(aspect) / 1.265;
+    let size = vec2<f32>(aspect, 1.0) / k;
+    let p = uv * size;
+    let c1 = vec2<f32>(0.1 * size.x + 0.15 * sin(t * 0.05), 0.05 * size.y + 0.12 * cos(t * 0.04));
+    let c2 = vec2<f32>(0.9 * size.x + 0.15 * cos(t * 0.045), 0.95 * size.y + 0.12 * sin(t * 0.055));
     let bend = 0.35 * (soft(p * 0.8 + vec2<f32>(0.02 * t, 0.0)) - 0.5);
     let l1 = 1.0 - smoothstep(0.0, 1.1, length(p - c1) + bend);
     let l2 = 1.0 - smoothstep(0.0, 0.9, length(p - c2) - bend);
