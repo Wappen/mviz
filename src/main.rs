@@ -449,7 +449,7 @@ impl App {
         let gfx = self.gfx.as_mut().expect("checked above");
         let (w, h) = gfx.size();
         let window = gfx.window().clone();
-        let mut scene = Scene { clear: modes::base(), ..Default::default() };
+        let mut scene = Scene { clear: modes::base(), time: now, ..Default::default() };
         self.ui.controls = !self.home_open && self.playing.is_some();
         let target = if self.home_open { 1.0 } else { 0.0 };
         self.home_alpha += (target - self.home_alpha) * (dt * 10.0).min(1.0);
@@ -509,7 +509,7 @@ impl App {
         // Paused or start screen over the picture: dim it.
         let pause_dim = self.playing.as_ref().map_or(0.0, |p| 0.6 * p.dim);
         // The start screen blurs what is behind it: the picture, or (started
-        // without a file) its own moving colour.
+        // without a file) its own light from the corners.
         scene.blur = if self.playing.is_some() { self.home_alpha } else { 1.0 };
         let home_dim = if self.playing.is_some() { HOME_DIM * self.home_alpha } else { 0.0 };
         let dim = pause_dim.max(home_dim);

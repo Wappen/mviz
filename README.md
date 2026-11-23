@@ -62,8 +62,8 @@ mviz                 # the start screen
 
 Without a file, mviz opens a start screen: open a file or a folder, reopen the
 last one, or **capture** an output (whatever it plays) or an input such as a microphone and
-watch it live. Resting on a source shows its input level. Behind it, slow
-fields of colour drift and blend under a heavy blur. Tab brings the same
+watch it live. Resting on a source shows its input level. Behind it, light pools from two
+corners over deep navy, slowly drifting and changing hue. Tab brings the same
 screen up over the picture, blurring and darkening it.
 
 The song starts at once (about 40 ms after launch) and loops without a gap.

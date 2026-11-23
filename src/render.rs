@@ -113,42 +113,6 @@ mod preview {
         std::fs::write(path, out).unwrap();
     }
 
-    /// Short videos of each way the start screen's colour can move:
-    /// `MVIZ_OUT=dir cargo test --release backdrops -- --ignored`
-    #[test]
-    #[ignore]
-    fn backdrops() {
-        use crate::home::Motion;
-        let dir = std::env::var("MVIZ_OUT").unwrap();
-        let (w, h) = (1280u32, 800u32);
-        let mut gfx = Gfx::new_offscreen(w, h);
-        let mut home = crate::home::Home::new();
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        home.update(0.0);
-        for (name, motion) in [("tide2", Motion::Tide)] {
-            let mut ff = Command::new("ffmpeg")
-                .args(["-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgba", "-s", &format!("{w}x{h}"), "-r", "30", "-i", "-"])
-                .args(["-c:v", "libx264", "-preset", "slow", "-crf", "20", "-pix_fmt", "yuv420p", "-movflags", "+faststart"])
-                .arg(format!("{dir}/{name}.mp4"))
-                .stdin(Stdio::piped())
-                .spawn()
-                .unwrap();
-            let mut pipe = ff.stdin.take().unwrap();
-            // 20 s of the screen, played back twice as fast.
-            for f in 0..300 {
-                let t = f as f64 / 15.0;
-                let mut scene = Scene { clear: modes::base(), blur: 1.0, ..Default::default() };
-                crate::home::draw_backdrop_as(&mut scene.background, t, w as f32, h as f32, motion);
-                let mut measure = |s: &str, size: f32| gfx.text_width(s, size);
-                home.draw(&mut scene.ui, &mut scene.texts, None, &mut measure, "mviz", false, 1.0, t, (w as f32, h as f32));
-                gfx.render(scene);
-                pipe.write_all(&gfx.read_frame()).unwrap();
-            }
-            drop(pipe);
-            assert!(ff.wait().unwrap().success());
-        }
-    }
-
     /// `MVIZ_OUT=dir [MVIZ_FILE=song] cargo test --release preview -- --ignored`
     #[test]
     #[ignore]
@@ -159,8 +123,8 @@ mod preview {
         let mut home = crate::home::Home::new();
         std::thread::sleep(std::time::Duration::from_millis(500));
         home.update(0.0);
-        for t in [0.0, 4.0, 8.0, 16.0] {
-            let mut scene = Scene { clear: modes::base(), blur: 1.0, ..Default::default() };
+        for t in [0.0, 15.0, 30.0, 60.0] {
+            let mut scene = Scene { clear: modes::base(), blur: 1.0, time: t, ..Default::default() };
             let mut measure = |s: &str, size: f32| gfx.text_width(s, size);
             home.draw(&mut scene.ui, &mut scene.texts, Some(&mut scene.background), &mut measure, "mviz", false, 1.0, t, (w as f32, h as f32));
             gfx.render(scene);

@@ -45,6 +45,7 @@ const SOLID: u32 = 0;
 const GLOW: u32 = 1;
 /// A fade from clear to its colour along `uv.x`, eased (smoothstep).
 const FADE: u32 = 2;
+const CORNER_LIGHT: u32 = 3;
 
 /// A list of shapes to draw in one go.
 #[derive(Default)]
@@ -95,6 +96,15 @@ impl Batch {
         self.quad(p, [[0.0, 0.0], [1.0, 0.0], [1.0, 0.0], [0.0, 0.0]], [c; 4], FADE);
     }
 
+    /// The start screen's background over the whole `w` × `h` area, at
+    /// strength `a`: light pooling from two opposite corners over deep navy
+    /// (see `corner_light` in the shader). It moves with `Scene::time`.
+    pub fn corner_light(&mut self, w: f32, h: f32, a: f32) {
+        let p = [[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]];
+        let uv = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        self.quad(p, uv, [[1.0, 1.0, 1.0, a]; 4], CORNER_LIGHT);
+    }
+
     /// Soft round glow (gaussian-like falloff) with radii `rx`, `ry`.
     pub fn glow(&mut self, cx: f32, cy: f32, rx: f32, ry: f32, c: Rgba) {
         self.ellipse(cx, cy, rx, ry, c, GLOW);
@@ -134,6 +144,8 @@ pub struct Scene {
     /// How much the background and phosphor are blurred (0..1): behind the
     /// start screen. The controls and text stay sharp.
     pub blur: f32,
+    /// Seconds, for shapes that move by themselves (`Batch::corner_light`).
+    pub time: f64,
     /// Blended on top (controls).
     pub ui: Batch,
     pub texts: Vec<Text>,
@@ -310,7 +322,7 @@ impl Gfx {
             label: Some("globals"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
                 count: None,
             }],
@@ -707,7 +719,7 @@ impl Gfx {
             (None, Output::Window { .. }) => return,
         };
         let (w, h) = self.size();
-        self.queue.write_buffer(&self.globals, 0, bytemuck::cast_slice(&[w, h, 0.0, 0.0]));
+        self.queue.write_buffer(&self.globals, 0, bytemuck::cast_slice(&[w, h, (scene.time % 10_000.0) as f32, 0.0]));
 
         // All shapes go into one vertex buffer; remember each layer's range.
         let empty = Batch::default();
@@ -876,7 +888,7 @@ fn draw_range(pass: &mut wgpu::RenderPass, pipe: &wgpu::RenderPipeline, globals:
 }
 
 const SHAPES_WGSL: &str = r#"
-struct Globals { size: vec2<f32>, pad: vec2<f32> };
+struct Globals { size: vec2<f32>, time: f32, pad: f32 };
 @group(0) @binding(0) var<uniform> g: Globals;
 
 struct VIn {
@@ -913,9 +925,55 @@ fn fs(i: VOut) -> @location(0) vec4<f32> {
         // Eased fade: flat at both ends, so neither end shows as an edge.
         let t = clamp(i.uv.x, 0.0, 1.0);
         a = t * t * (3.0 - 2.0 * t);
+    } else if (i.kind == 3u) {
+        return vec4<f32>(corner_light(i.uv) * i.color.a, 1.0);
     }
     let alpha = i.color.a * a;
     return vec4<f32>(i.color.rgb * alpha, alpha);
+}
+
+fn hash(p: vec2<f32>) -> f32 {
+    let q = fract(p * vec2<f32>(123.34, 456.21));
+    let r = q + dot(q, q + 45.32);
+    return fract(r.x * r.y);
+}
+
+// Smooth value noise, 0..1.
+fn noise(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    return mix(mix(hash(i), hash(i + vec2<f32>(1.0, 0.0)), u.x),
+               mix(hash(i + vec2<f32>(0.0, 1.0)), hash(i + vec2<f32>(1.0, 1.0)), u.x), u.y);
+}
+
+// Two octaves only: broad, soft variation with no fine grain.
+fn soft(p0: vec2<f32>) -> f32 {
+    return 0.65 * noise(p0) + 0.35 * noise(mat2x2<f32>(1.6, 1.2, -1.2, 1.6) * p0 + vec2<f32>(3.1, 7.7));
+}
+
+// Light pooling from two opposite corners over deep navy, like a dark
+// gradient wallpaper: blue from the top-left, magenta from the
+// bottom-right. Each pool's centre wanders around its corner and its rim
+// is bent by broad noise, so it is never round; both slowly shift hue
+// (blue to indigo, magenta to rust). Nearly even from edge to middle, a
+// touch stronger at the edges.
+fn corner_light(uv: vec2<f32>) -> vec3<f32> {
+    let t = g.time;
+    let aspect = g.size.x / max(g.size.y, 1.0);
+    let p = vec2<f32>(uv.x * aspect, uv.y);
+    let c1 = vec2<f32>(0.1 * aspect + 0.15 * sin(t * 0.05), 0.05 + 0.12 * cos(t * 0.04));
+    let c2 = vec2<f32>(0.9 * aspect + 0.15 * cos(t * 0.045), 0.95 + 0.12 * sin(t * 0.055));
+    let bend = 0.35 * (soft(p * 0.8 + vec2<f32>(0.02 * t, 0.0)) - 0.5);
+    let l1 = 1.0 - smoothstep(0.0, 1.1, length(p - c1) + bend);
+    let l2 = 1.0 - smoothstep(0.0, 0.9, length(p - c2) - bend);
+    let h = 0.5 + 0.5 * sin(t * 0.03);
+    let navy = vec3<f32>(0.010, 0.020, 0.070);
+    let c = navy
+        + mix(vec3<f32>(0.02, 0.17, 0.30), vec3<f32>(0.10, 0.08, 0.32), h) * l1 * l1
+        + mix(vec3<f32>(0.26, 0.04, 0.14), vec3<f32>(0.24, 0.08, 0.04), h) * l2 * l2;
+    let d = min(min(uv.x, 1.0 - uv.x) * aspect, min(uv.y, 1.0 - uv.y));
+    return c * mix(0.9, 1.0, 1.0 - smoothstep(0.0, 0.5, d));
 }
 "#;
 
