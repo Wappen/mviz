@@ -123,7 +123,7 @@ mod preview {
         let mut home = crate::home::Home::new();
         std::thread::sleep(std::time::Duration::from_millis(500));
         home.update(0.0);
-        for t in [0.0, 15.0, 30.0, 60.0] {
+        for t in [0.0, 4.0, 8.0, 16.0] {
             let mut scene = Scene { clear: modes::base(), blur: 1.0, ..Default::default() };
             let mut measure = |s: &str, size: f32| gfx.text_width(s, size);
             home.draw(&mut scene.ui, &mut scene.texts, Some(&mut scene.background), &mut measure, "mviz", false, 1.0, t, (w as f32, h as f32));

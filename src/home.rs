@@ -319,20 +319,18 @@ fn home_relative(path: &std::path::Path) -> String {
     }
 }
 
-/// Large soft fields of colour, each wandering on its own slow loop and
+/// Large soft fields of colour, each wandering on its own loop and
 /// drifting between two hues, overlapping into one another. Drawn sharp-ish
 /// here; the renderer blurs them heavily into a smooth wash.
 fn draw_backdrop(g: &mut Batch, now: f64, w: f32, h: f32) {
     // Centre (share of the window), loop size, radius (share of the larger
     // side), the two colours it drifts between, and its periods (s).
     type Field = ([f32; 2], [f32; 2], f32, [f32; 3], [f32; 3], [f32; 3]);
-    const FIELDS: [Field; 6] = [
-        ([0.15, 0.85], [0.18, 0.12], 0.75, [0.26, 0.10, 0.52], [0.10, 0.14, 0.50], [71.0, 53.0, 47.0]),
-        ([0.85, 0.15], [0.14, 0.16], 0.70, [0.04, 0.30, 0.36], [0.08, 0.20, 0.46], [59.0, 83.0, 61.0]),
-        ([0.90, 0.90], [0.12, 0.12], 0.60, [0.48, 0.16, 0.12], [0.42, 0.08, 0.26], [67.0, 43.0, 79.0]),
-        ([0.10, 0.15], [0.14, 0.16], 0.60, [0.40, 0.08, 0.32], [0.24, 0.08, 0.44], [89.0, 61.0, 53.0]),
-        ([0.50, 0.55], [0.24, 0.18], 0.55, [0.06, 0.08, 0.26], [0.14, 0.06, 0.26], [97.0, 73.0, 67.0]),
-        ([0.60, 0.00], [0.30, 0.08], 0.45, [0.30, 0.10, 0.36], [0.06, 0.28, 0.24], [79.0, 101.0, 89.0]),
+    const FIELDS: [Field; 4] = [
+        ([0.25, 0.75], [0.28, 0.22], 0.62, [0.17, 0.06, 0.36], [0.05, 0.09, 0.32], [23.0, 17.0, 19.0]),
+        ([0.75, 0.25], [0.26, 0.24], 0.58, [0.02, 0.19, 0.23], [0.12, 0.06, 0.30], [19.0, 29.0, 23.0]),
+        ([0.80, 0.85], [0.22, 0.18], 0.48, [0.30, 0.09, 0.07], [0.26, 0.04, 0.17], [29.0, 13.0, 31.0]),
+        ([0.20, 0.15], [0.24, 0.20], 0.44, [0.24, 0.04, 0.20], [0.03, 0.16, 0.14], [17.0, 23.0, 13.0]),
     ];
     let t = now as f32;
     let side = w.max(h);
@@ -344,7 +342,7 @@ fn draw_backdrop(g: &mut Batch, now: f64, w: f32, h: f32) {
         let k = 0.5 + 0.5 * wave(period[2], phase * 0.7);
         let col = [a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k, a[2] + (b[2] - a[2]) * k];
         // Breathing in size, a little out of step with the wandering.
-        let rr = r * side * (1.0 + 0.12 * wave(period[1] * 0.9, phase + 2.0));
+        let rr = r * side * (1.0 + 0.2 * wave(period[1] * 0.7, phase + 2.0));
         g.glow(x, y, rr, rr * 0.8, [col[0], col[1], col[2], 0.9]);
     }
 }
