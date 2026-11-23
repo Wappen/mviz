@@ -313,11 +313,7 @@ impl Home {
             text(msg.into(), x0 + 20.0, capture_top + (ROW_H - 14.0 * 1.3) / 2.0, 14.0, white(0.38));
         }
 
-        if overlay {
-            let hint = "Tab closes";
-            let hw = measure(hint, 14.0);
-            text(hint.into(), w - 16.0 - hw, h - 16.0 - 14.0 * 1.3, 14.0, white(0.45));
-        } else {
+        if !overlay {
             let hint = "or drop a file or folder anywhere";
             let hw = measure(hint, 14.0);
             text(hint.into(), (w - hw) / 2.0, h - 40.0 - 14.0 * 1.3, 14.0, white(0.38));
