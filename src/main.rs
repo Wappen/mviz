@@ -40,8 +40,47 @@ use gfx::{Gfx, Scene, Text};
 
 /// How far the start screen darkens the (blurred) picture behind it.
 const HOME_DIM: f32 = 0.5;
+/// How far a drag over the window darkens the (blurred) picture.
+const DRAG_DIM: f32 = 0.55;
+
+/// While files are dragged over the window: what dropping them would do,
+/// centred over the blurred picture. At strength `a`.
+fn drag_overlay(texts: &mut Vec<Text>, measure: &mut dyn FnMut(&str, f32) -> f32, what: &Droppable, a: f32, (w, h): (f32, f32)) {
+    let spaced = |s: &str| s.chars().map(String::from).collect::<Vec<_>>().join("\u{2009}");
+    let (label, title, sub) = match what {
+        Droppable::Song(p) => ("DROP TO PLAY", song_name(p), String::new()),
+        Droppable::Folder(p, n) => ("DROP TO PLAY FOLDER", song_name_or_dir(p), format!("{n} song{}", if *n == 1 { "" } else { "s" })),
+        Droppable::Nothing => ("CAN\u{2019}T PLAY THIS", "No audio files".to_string(), "MP3, FLAC, OGG, WAV, M4A and more".to_string()),
+        Droppable::Unknown => ("DROP TO OPEN", String::new(), String::new()),
+    };
+    let playable = !matches!(what, Droppable::Nothing);
+    const TITLE: f32 = 32.0;
+    let mut height = 12.0 * 1.3;
+    if !title.is_empty() {
+        height += 14.0 + TITLE * 1.3;
+    }
+    if !sub.is_empty() {
+        height += 8.0 + 15.0 * 1.3;
+    }
+    let mut y = (h - height) / 2.0;
+    let mut line = |text: String, size: f32, alpha: f32, y: f32| {
+        let text = ui::fit(&text, size, w - 64.0, measure);
+        let tw = measure(&text, size);
+        texts.push(Text { text, x: (w - tw) / 2.0, y, size, color: [1.0, 1.0, 1.0, alpha * a] });
+    };
+    line(spaced(label), 12.0, 0.5, y);
+    y += 12.0 * 1.3;
+    if !title.is_empty() {
+        y += 14.0;
+        line(title, TITLE, if playable { 0.95 } else { 0.6 }, y);
+        y += TITLE * 1.3;
+    }
+    if !sub.is_empty() {
+        line(sub, 15.0, 0.45, y + 8.0);
+    }
+}
 use modes::stereo::Stereo;
-use playlist::Playlist;
+use playlist::{Droppable, Playlist};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU32;
 use std::sync::{mpsc, Arc};
@@ -187,8 +226,15 @@ struct App {
     notice: Option<(String, f64)>,
     modifiers: ModifiersState,
     gfx: Option<Gfx>,
-    /// Files dropped onto the window (Wayland; X11 drops come as events).
-    drops: Option<mpsc::Receiver<PathBuf>>,
+    /// Drags over the window (Wayland; X11 drags come as events).
+    drops: Option<mpsc::Receiver<dnd::Drag>>,
+    /// Files being dragged over the window: what dropping them would play.
+    drag: Option<Droppable>,
+    /// The same, kept while the overlay fades out, and how much it shows.
+    drag_shown: Droppable,
+    drag_alpha: f32,
+    /// Paths of a drag over the window on X11 (reported one by one).
+    x11_drag: Vec<PathBuf>,
     start: Instant,
     last_frame: Instant,
 }
@@ -204,6 +250,15 @@ impl App {
     }
 
     /// Plays a file, or every song of a folder.
+    /// Files dropped onto the window.
+    fn dropped(&mut self, what: Droppable) {
+        self.drag = None;
+        match what.path() {
+            Some(p) => self.open_path(p.to_path_buf()),
+            None => self.notify("Nothing mviz can play in that".into()),
+        }
+    }
+
     fn open_path(&mut self, path: PathBuf) {
         if path.is_dir() {
             match Playlist::scan(&path, settings::load_sort()) {
@@ -423,8 +478,13 @@ impl App {
             return;
         }
 
-        if let Some(path) = self.drops.as_ref().and_then(|d| d.try_iter().last()) {
-            self.open_path(path);
+        let drags: Vec<dnd::Drag> = self.drops.as_ref().map(|d| d.try_iter().collect()).unwrap_or_default();
+        for drag in drags {
+            match drag {
+                dnd::Drag::Over(what) => self.drag = Some(what),
+                dnd::Drag::Left => self.drag = None,
+                dnd::Drag::Dropped(what) => self.dropped(what),
+            }
         }
         if let Some(picked) = self.picker.as_ref().and_then(|rx| rx.try_recv().ok()) {
             self.picker = None;
@@ -450,7 +510,12 @@ impl App {
         let (w, h) = gfx.size();
         let window = gfx.window().clone();
         let mut scene = Scene { clear: modes::base(), time: now, ..Default::default() };
-        self.ui.controls = !self.home_open && self.playing.is_some();
+        self.ui.controls = !self.home_open && self.playing.is_some() && self.drag.is_none();
+        let target = if self.drag.is_some() { 1.0 } else { 0.0 };
+        self.drag_alpha += (target - self.drag_alpha) * (dt * 14.0).min(1.0);
+        if let Some(d) = &self.drag {
+            self.drag_shown = d.clone();
+        }
         let target = if self.home_open { 1.0 } else { 0.0 };
         self.home_alpha += (target - self.home_alpha) * (dt * 10.0).min(1.0);
 
@@ -510,9 +575,9 @@ impl App {
         let pause_dim = self.playing.as_ref().map_or(0.0, |p| 0.6 * p.dim);
         // The start screen blurs what is behind it: the picture, or (started
         // without a file) its own light from the corners.
-        scene.blur = if self.playing.is_some() { self.home_alpha } else { 1.0 };
+        scene.blur = if self.playing.is_some() { self.home_alpha.max(self.drag_alpha) } else { 1.0 };
         let home_dim = if self.playing.is_some() { HOME_DIM * self.home_alpha } else { 0.0 };
-        let dim = pause_dim.max(home_dim);
+        let dim = pause_dim.max(home_dim).max(DRAG_DIM * self.drag_alpha);
         if dim > 0.005 {
             scene.ui.rect(0.0, 0.0, w, h, [0.0, 0.0, 0.0, dim]);
         }
@@ -537,7 +602,11 @@ impl App {
         if self.home_alpha > 0.01 {
             let standalone = self.playing.is_none();
             let backdrop = if standalone { Some(&mut scene.background) } else { None };
-            self.home.draw(&mut scene.ui, &mut scene.texts, backdrop, &mut measure, &home_title, !standalone, self.home_alpha, now, (w, h));
+            let a = self.home_alpha * (1.0 - self.drag_alpha);
+            self.home.draw(&mut scene.ui, &mut scene.texts, backdrop, &mut measure, &home_title, !standalone, a, now, (w, h));
+        }
+        if self.drag_alpha > 0.01 {
+            drag_overlay(&mut scene.texts, &mut measure, &self.drag_shown, self.drag_alpha, (w, h));
         }
 
         if let Some((msg, at)) = &self.notice {
@@ -678,7 +747,24 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(s) => gfx.resize(s.width, s.height),
             WindowEvent::RedrawRequested => self.frame(event_loop),
-            WindowEvent::DroppedFile(path) => self.open_path(path),
+            // X11: each dragged path is reported on its own.
+            WindowEvent::HoveredFile(path) => {
+                self.x11_drag.push(path);
+                self.drag = Some(Droppable::of(&self.x11_drag));
+            }
+            WindowEvent::HoveredFileCancelled => {
+                self.x11_drag.clear();
+                self.drag = None;
+            }
+            WindowEvent::DroppedFile(path) => {
+                // Only the first of several paths dropped at once.
+                if !self.x11_drag.is_empty() {
+                    let what = Droppable::of(&std::mem::take(&mut self.x11_drag));
+                    self.dropped(what);
+                } else if self.drag.is_none() && self.pending.is_none() {
+                    self.dropped(Droppable::of(&[path]));
+                }
+            }
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed && !event.repeat {
@@ -762,6 +848,10 @@ fn main() {
         modifiers: ModifiersState::empty(),
         gfx: None,
         drops: None,
+        drag: None,
+        drag_shown: Droppable::Unknown,
+        drag_alpha: 0.0,
+        x11_drag: Vec::new(),
         start: now,
         last_frame: now,
     };

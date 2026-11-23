@@ -1,10 +1,12 @@
-//! Files dropped onto the window, on Wayland.
+//! Files dragged over and dropped onto the window, on Wayland.
 //!
 //! winit only reports dropped files on X11, so on Wayland mviz listens for
 //! them itself: it shares the window's Wayland connection, gets its own data
-//! device for the seat, accepts drags that carry files (`text/uri-list`) and
-//! reads the dropped paths. This runs on its own thread with its own event
-//! queue; winit's handling of the window is untouched.
+//! device for the seat, and reads the paths a drag carries
+//! (`text/uri-list`) as soon as it enters the window, so the window can say
+//! what dropping would do. A drag with nothing mviz can play is refused (the
+//! cursor shows it). This runs on its own thread with its own event queue;
+//! winit's handling of the window is untouched.
 
 use raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
 use std::collections::HashMap;
@@ -12,6 +14,7 @@ use std::ffi::OsString;
 use std::io::Read;
 use std::os::unix::ffi::OsStringExt;
 use std::os::fd::AsFd;
+use crate::playlist::Droppable;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use wayland_client::backend::{Backend, ObjectId};
@@ -25,9 +28,19 @@ use winit::window::Window;
 
 const URI_LIST: &str = "text/uri-list";
 
+/// What happens with a drag over the window.
+pub enum Drag {
+    /// Files are being dragged over it: what dropping them would play.
+    Over(Droppable),
+    /// The drag left without dropping.
+    Left,
+    /// Dropped: what to play.
+    Dropped(Droppable),
+}
+
 /// Starts listening for drops on `window`. Returns `None` when the window is
 /// not on Wayland (X11 reports drops through winit) or setup fails.
-pub fn listen(window: &Window) -> Option<mpsc::Receiver<PathBuf>> {
+pub fn listen(window: &Window) -> Option<mpsc::Receiver<Drag>> {
     let RawDisplayHandle::Wayland(d) = window.display_handle().ok()?.as_raw() else { return None };
     // SAFETY: the display stays valid while the window exists, i.e. for the
     // whole run of mviz (the window is never closed before exit).
@@ -45,13 +58,13 @@ pub fn listen(window: &Window) -> Option<mpsc::Receiver<PathBuf>> {
     Some(rx)
 }
 
-fn run(conn: Connection, tx: mpsc::Sender<PathBuf>) -> Result<(), String> {
+fn run(conn: Connection, tx: mpsc::Sender<Drag>) -> Result<(), String> {
     let (globals, mut queue) = registry_queue_init::<State>(&conn).map_err(|e| e.to_string())?;
     let qh = queue.handle();
     let manager: WlDataDeviceManager = globals.bind(&qh, 1..=3, ()).map_err(|e| e.to_string())?;
     let seat: WlSeat = globals.bind(&qh, 1..=1, ()).map_err(|e| e.to_string())?;
     manager.get_data_device(&seat, &qh, ());
-    let mut state = State { conn: conn.clone(), tx, mimes: HashMap::new(), current: None };
+    let mut state = State { conn: conn.clone(), tx, mimes: HashMap::new(), current: None, what: Droppable::Unknown };
     loop {
         queue.blocking_dispatch(&mut state).map_err(|e| e.to_string())?;
     }
@@ -59,11 +72,13 @@ fn run(conn: Connection, tx: mpsc::Sender<PathBuf>) -> Result<(), String> {
 
 struct State {
     conn: Connection,
-    tx: mpsc::Sender<PathBuf>,
+    tx: mpsc::Sender<Drag>,
     /// The types each pending offer can provide.
     mimes: HashMap<ObjectId, Vec<String>>,
-    /// The offer being dragged over the window, if it carries files.
+    /// The offer being dragged over the window, if it carries files, and
+    /// what dropping it would play.
     current: Option<WlDataOffer>,
+    what: Droppable,
 }
 
 impl Dispatch<WlDataDevice, ()> for State {
@@ -75,27 +90,44 @@ impl Dispatch<WlDataDevice, ()> for State {
             }
             Event::Enter { serial, id: Some(offer), .. } => {
                 let files = state.mimes.get(&offer.id()).is_some_and(|m| m.iter().any(|m| m == URI_LIST));
-                if files {
+                if !files {
+                    offer.accept(serial, None);
+                    state.forget(offer);
+                    return;
+                }
+                // Look at the paths now (most sources give them before the
+                // drop) and refuse the drag if none of them can be played.
+                let what = Droppable::of(&state.receive(&offer));
+                if what == Droppable::Nothing {
+                    offer.accept(serial, None);
+                    if offer.version() >= 3 {
+                        offer.set_actions(DndAction::empty(), DndAction::None);
+                    }
+                } else {
                     offer.accept(serial, Some(URI_LIST.into()));
                     if offer.version() >= 3 {
                         offer.set_actions(DndAction::Copy, DndAction::Copy);
                     }
-                    state.current = Some(offer);
-                } else {
-                    offer.accept(serial, None);
-                    state.forget(offer);
+                }
+                let _ = state.tx.send(Drag::Over(what.clone()));
+                state.what = what;
+                if let Some(old) = state.current.replace(offer) {
+                    state.forget(old);
                 }
             }
             Event::Leave => {
                 if let Some(offer) = state.current.take() {
                     state.forget(offer);
+                    let _ = state.tx.send(Drag::Left);
                 }
             }
             Event::Drop => {
                 if let Some(offer) = state.current.take() {
-                    for path in state.receive(&offer) {
-                        let _ = state.tx.send(path);
-                    }
+                    let what = match std::mem::replace(&mut state.what, Droppable::Unknown) {
+                        Droppable::Unknown => Droppable::of(&state.receive(&offer)),
+                        what => what,
+                    };
+                    let _ = state.tx.send(Drag::Dropped(what));
                     if offer.version() >= 3 {
                         offer.finish();
                     }
@@ -118,15 +150,21 @@ impl State {
         offer.destroy();
     }
 
-    /// Reads the dropped file list from the drag source.
+    /// Reads the dragged file list from the drag source. Gives up (empty)
+    /// after half a second, so a source that never answers can't stall
+    /// drag and drop.
     fn receive(&self, offer: &WlDataOffer) -> Vec<PathBuf> {
         let Ok((mut reader, writer)) = std::io::pipe() else { return Vec::new() };
         offer.receive(URI_LIST.into(), writer.as_fd());
         drop(writer);
         let _ = self.conn.flush();
-        let mut list = String::new();
-        let _ = reader.read_to_string(&mut list);
-        parse_uri_list(&list)
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut list = String::new();
+            let _ = reader.read_to_string(&mut list);
+            let _ = tx.send(list);
+        });
+        rx.recv_timeout(std::time::Duration::from_millis(500)).map(|l| parse_uri_list(&l)).unwrap_or_default()
     }
 }
 

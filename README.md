@@ -75,7 +75,7 @@ The song starts at once (about 40 ms after launch) and loops without a gap.
 | Left-drag | Move the window (from fullscreen: back to a window, then move) |
 | Double-click or F11 | Fullscreen on / off |
 | Timeline at the bottom | Shown while the cursor is visible; click or drag to seek |
-| Drop a file or folder on the window | Play it instead |
+| Drag a file or folder over the window | See what dropping it plays; drop to play it instead |
 | Right edge (folder) | The playlist; click a song to play it (L keeps it open) |
 | S, or the order in the playlist | Play the folder by name, newest first, or shuffled |
 | ← / → | Previous / next song of the folder |

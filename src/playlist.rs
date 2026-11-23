@@ -14,6 +14,46 @@ pub fn is_audio(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()).is_some_and(|e| AUDIO.contains(&e.to_ascii_lowercase().as_str()))
 }
 
+/// What dropping some files or folders onto the window would play: the
+/// first song, or folder with songs in it, among them.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Droppable {
+    Song(PathBuf),
+    /// A folder and how many songs it has.
+    Folder(PathBuf, usize),
+    /// Nothing mviz can play.
+    Nothing,
+    /// Not known yet (the drag's source tells only on the drop).
+    Unknown,
+}
+
+impl Droppable {
+    pub fn of(paths: &[PathBuf]) -> Droppable {
+        if paths.is_empty() {
+            return Droppable::Unknown;
+        }
+        for p in paths {
+            if p.is_dir() {
+                let n = std::fs::read_dir(p).map_or(0, |d| d.filter_map(|e| e.ok()).filter(|e| is_audio(&e.path()) && e.path().is_file()).count());
+                if n > 0 {
+                    return Droppable::Folder(p.clone(), n);
+                }
+            } else if p.is_file() && is_audio(p) {
+                return Droppable::Song(p.clone());
+            }
+        }
+        Droppable::Nothing
+    }
+
+    /// The file or folder to open, if any.
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            Droppable::Song(p) | Droppable::Folder(p, _) => Some(p),
+            _ => None,
+        }
+    }
+}
+
 /// The order a folder plays in.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Sort {
@@ -195,6 +235,23 @@ pub fn natural(a: &str, b: &str) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_drop_plays_the_first_song_or_folder_with_songs() {
+        let dir = std::env::temp_dir().join(format!("mviz-drop-{}", std::process::id()));
+        let songs = dir.join("songs");
+        let empty = dir.join("empty");
+        std::fs::create_dir_all(&songs).unwrap();
+        std::fs::create_dir_all(&empty).unwrap();
+        for f in ["songs/a.mp3", "songs/b.flac", "songs/notes.txt", "c.ogg", "d.pdf"] {
+            std::fs::write(dir.join(f), b"").unwrap();
+        }
+        assert_eq!(Droppable::of(&[]), Droppable::Unknown);
+        assert_eq!(Droppable::of(&[dir.join("d.pdf"), empty.clone()]), Droppable::Nothing);
+        assert_eq!(Droppable::of(&[dir.join("d.pdf"), dir.join("c.ogg")]), Droppable::Song(dir.join("c.ogg")));
+        assert_eq!(Droppable::of(&[empty, songs.clone(), dir.join("c.ogg")]), Droppable::Folder(songs, 2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn sorts_numbers_naturally() {

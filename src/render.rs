@@ -151,6 +151,21 @@ mod preview {
                 }
                 gfx.render(scene);
                 save(&gfx, w, h, &format!("{dir}/song_{}.ppm", if blur > 0.0 { "menu" } else { "plain" }));
+                if blur > 0.0 {
+                    for (name, what) in [
+                        ("folder", crate::playlist::Droppable::Folder("/home/me/Music/Ambient Works".into(), 12)),
+                        ("song", crate::playlist::Droppable::Song("/home/me/Music/Falling.mp3".into())),
+                        ("nothing", crate::playlist::Droppable::Nothing),
+                    ] {
+                        let mut scene = Scene { clear: modes::base(), blur: 1.0, ..Default::default() };
+                        scene.phosphor = Some(stereo.draw(&mut scene.background, &track, rate, t * rate as f64, 0.0, Some(&tl), w as f32, h as f32));
+                        scene.ui.rect(0.0, 0.0, w as f32, h as f32, [0.0, 0.0, 0.0, crate::DRAG_DIM]);
+                        let mut measure = |s: &str, size: f32| gfx.text_width(s, size);
+                        crate::drag_overlay(&mut scene.texts, &mut measure, &what, 1.0, (w as f32, h as f32));
+                        gfx.render(scene);
+                        save(&gfx, w, h, &format!("{dir}/drag_{name}.ppm"));
+                    }
+                }
             } else {
                 gfx.render(scene);
             }
