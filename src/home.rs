@@ -1,6 +1,6 @@
 //! The start screen: shown when mviz starts without a file, and over the
 //! picture when Tab is pressed. Open a file or a folder, capture a source
-//! (what's playing, or an input), or reopen the last file or folder.
+//! (an output: what it plays; or an input), or reopen the last file or folder.
 //!
 //! The rows look like the rest of the controls: white text at a few
 //! strengths, and the 2 px bar of the timeline's playhead beside the row

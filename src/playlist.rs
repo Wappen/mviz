@@ -1,9 +1,11 @@
 //! A folder of songs, played in order (and from the start again after the
-//! last). Song lengths are read from the files' headers in the background.
+//! last). The order is by name, newest first, or shuffled. Song lengths are
+//! read from the files' headers in the background.
 
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 /// Extensions mviz can play (what Symphonia decodes).
 pub const AUDIO: &[&str] = &["mp3", "flac", "ogg", "oga", "wav", "wave", "aif", "aiff", "aifc", "caf", "m4a", "mp4", "aac", "alac", "mka", "mkv", "webm"];
@@ -12,17 +14,66 @@ pub fn is_audio(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()).is_some_and(|e| AUDIO.contains(&e.to_ascii_lowercase().as_str()))
 }
 
+/// The order a folder plays in.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Sort {
+    /// By file name, numbers as numbers ("2" before "10").
+    Name,
+    /// Most recently changed files first.
+    Newest,
+    Shuffle,
+}
+
+impl Sort {
+    pub const ALL: [Sort; 3] = [Sort::Name, Sort::Newest, Sort::Shuffle];
+
+    /// As shown in the playlist.
+    pub fn label(self) -> &'static str {
+        match self {
+            Sort::Name => "by name",
+            Sort::Newest => "newest first",
+            Sort::Shuffle => "shuffled",
+        }
+    }
+
+    /// The next mode (the playlist cycles through them).
+    pub fn next(self) -> Sort {
+        let i = Self::ALL.iter().position(|&s| s == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+
+    /// Name in the settings file.
+    pub fn key(self) -> &'static str {
+        match self {
+            Sort::Name => "name",
+            Sort::Newest => "newest",
+            Sort::Shuffle => "shuffle",
+        }
+    }
+
+    pub fn from_key(k: &str) -> Option<Sort> {
+        Self::ALL.into_iter().find(|s| s.key() == k)
+    }
+}
+
+#[derive(Clone)]
 pub struct Playlist {
     /// The folder's name.
     pub name: String,
-    pub songs: Vec<PathBuf>,
-    /// Song lengths in seconds as they are read (`None`: not yet, or unknown).
-    pub lengths: Arc<Mutex<Vec<Option<f64>>>>,
+    /// The songs by name; `order` says which plays when.
+    songs: Vec<PathBuf>,
+    modified: Vec<SystemTime>,
+    /// Song lengths in seconds as they are read (`None`: not yet, or
+    /// unknown), indexed like `songs`.
+    lengths: Arc<Mutex<Vec<Option<f64>>>>,
+    /// Play position → song.
+    order: Vec<usize>,
+    pub sort: Sort,
 }
 
 impl Playlist {
-    /// The audio files directly in `dir`, in natural order ("2" before "10").
-    pub fn scan(dir: &Path) -> Result<Playlist, String> {
+    /// The audio files directly in `dir`, in `sort` order.
+    pub fn scan(dir: &Path, sort: Sort) -> Result<Playlist, String> {
         let entries = std::fs::read_dir(dir).map_err(|e| format!("cannot open {}: {e}", dir.display()))?;
         let mut songs: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.is_file() && is_audio(p)).collect();
         songs.sort_by(|a, b| natural(&file_name(a), &file_name(b)));
@@ -30,6 +81,7 @@ impl Playlist {
         if songs.is_empty() {
             return Err(format!("no audio files in {name}"));
         }
+        let modified = songs.iter().map(|p| p.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH)).collect();
         let lengths = Arc::new(Mutex::new(vec![None; songs.len()]));
         let (paths, out) = (songs.clone(), lengths.clone());
         std::thread::spawn(move || {
@@ -38,24 +90,65 @@ impl Playlist {
                 out.lock().unwrap()[i] = len;
             }
         });
-        Ok(Playlist { name, songs, lengths })
+        let pl = Playlist { name, songs, modified, lengths, order: Vec::new(), sort: Sort::Name };
+        Ok(pl.sorted(sort))
+    }
+
+    /// The same songs in `sort` order (shuffling again each time).
+    pub fn sorted(&self, sort: Sort) -> Playlist {
+        let mut order: Vec<usize> = (0..self.songs.len()).collect();
+        match sort {
+            Sort::Name => {}
+            Sort::Newest => order.sort_by(|&a, &b| self.modified[b].cmp(&self.modified[a])),
+            Sort::Shuffle => shuffle(&mut order),
+        }
+        Playlist { order, sort, ..self.clone() }
     }
 
     pub fn len(&self) -> usize {
-        self.songs.len()
+        self.order.len()
     }
 
-    pub fn next(&self, i: usize) -> usize {
-        (i + 1) % self.len()
+    pub fn next(&self, pos: usize) -> usize {
+        (pos + 1) % self.len()
     }
 
-    pub fn prev(&self, i: usize) -> usize {
-        (i + self.len() - 1) % self.len()
+    pub fn prev(&self, pos: usize) -> usize {
+        (pos + self.len() - 1) % self.len()
     }
 
-    /// Song names (file names without extension).
+    /// The song at play position `pos`.
+    pub fn path(&self, pos: usize) -> &Path {
+        &self.songs[self.order[pos]]
+    }
+
+    /// Where `other`'s position `pos` (same folder, other order) is here.
+    pub fn position_of(&self, other: &Playlist, pos: usize) -> usize {
+        let song = other.order[pos];
+        self.order.iter().position(|&s| s == song).unwrap_or(0)
+    }
+
+    /// Song names (file names without extension), in play order.
     pub fn names(&self) -> Vec<String> {
-        self.songs.iter().map(|p| crate::song_name(p)).collect()
+        self.order.iter().map(|&i| crate::song_name(&self.songs[i])).collect()
+    }
+
+    /// Song lengths as far as known, in play order.
+    pub fn lengths(&self) -> Vec<Option<f64>> {
+        let l = self.lengths.lock().unwrap();
+        self.order.iter().map(|&i| l[i]).collect()
+    }
+}
+
+/// Fisher–Yates with a small xorshift generator seeded from the clock
+/// (good enough to mix a playlist).
+fn shuffle(v: &mut [usize]) {
+    let mut x = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0x9e37_79b9, |d| d.as_nanos() as u64) | 1;
+    for i in (1..v.len()).rev() {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        v.swap(i, (x % (i as u64 + 1)) as usize);
     }
 }
 
@@ -101,12 +194,50 @@ pub fn natural(a: &str, b: &str) -> Ordering {
 
 #[cfg(test)]
 mod tests {
-    use super::natural;
+    use super::*;
 
     #[test]
     fn sorts_numbers_naturally() {
         let mut v = vec!["10 Ten.mp3", "2 Two.mp3", "1 one.mp3", "B.mp3", "a.mp3", "02b.mp3"];
         v.sort_by(|a, b| natural(a, b));
         assert_eq!(v, ["1 one.mp3", "2 Two.mp3", "02b.mp3", "10 Ten.mp3", "a.mp3", "B.mp3"]);
+    }
+
+    fn sample() -> Playlist {
+        let t = |s| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(s);
+        Playlist {
+            name: "x".into(),
+            songs: ["a", "b", "c", "d"].iter().map(PathBuf::from).collect(),
+            modified: vec![t(10), t(40), t(20), t(30)],
+            lengths: Arc::new(Mutex::new(vec![Some(1.0), Some(2.0), Some(3.0), Some(4.0)])),
+            order: vec![0, 1, 2, 3],
+            sort: Sort::Name,
+        }
+    }
+
+    #[test]
+    fn newest_first_and_positions_carry_over() {
+        let by_name = sample();
+        let newest = by_name.sorted(Sort::Newest);
+        assert_eq!(newest.names(), ["b", "d", "c", "a"]);
+        assert_eq!(newest.lengths(), [Some(2.0), Some(4.0), Some(3.0), Some(1.0)]);
+        // "c" is third by name and third newest; "a" moves from first to last.
+        assert_eq!(newest.position_of(&by_name, 2), 2);
+        assert_eq!(newest.position_of(&by_name, 0), 3);
+    }
+
+    #[test]
+    fn shuffle_keeps_every_song_once() {
+        let mut names = sample().sorted(Sort::Shuffle).names();
+        names.sort();
+        assert_eq!(names, ["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn sort_modes_cycle_and_round_trip() {
+        assert_eq!(Sort::Name.next().next().next(), Sort::Name);
+        for s in Sort::ALL {
+            assert_eq!(Sort::from_key(s.key()), Some(s));
+        }
     }
 }

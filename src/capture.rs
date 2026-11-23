@@ -2,8 +2,8 @@
 //! microphone, through PulseAudio (PipeWire answers as PulseAudio too).
 //!
 //! The capture callback writes into a `Ring`: the last ~44 s of stereo
-//! frames, readable by the visuals without locks, plus a running timeline
-//! overview (peak, rms per `WAVE_FRAMES`).
+//! frames, readable by the visuals without locks, plus the input level
+//! (peak, rms per `WAVE_FRAMES`) for the start screen's meter.
 
 use crate::audio::Samples;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -14,7 +14,7 @@ use std::sync::Arc;
 /// Frames kept (a power of two; ~44 s at 48 kHz).
 const CAP: usize = 1 << 21;
 /// Frames per overview bucket (as for songs).
-pub const WAVE_FRAMES: usize = 1024;
+const WAVE_FRAMES: usize = 1024;
 /// Overview buckets kept.
 const WAVE_CAP: usize = 4096;
 
@@ -25,14 +25,14 @@ pub struct SourceInfo {
     pub id: String,
     /// What to call it: the output's or input's own description.
     pub name: String,
-    /// A monitor: whatever is played on that output.
+    /// An output's monitor: whatever is played on it.
     pub monitor: bool,
 }
 
 impl SourceInfo {
     /// Second line in the list: what kind of source this is.
     pub fn kind(&self) -> &'static str {
-        if self.monitor { "what’s playing" } else { "input" }
+        if self.monitor { "output" } else { "input" }
     }
 }
 
@@ -40,7 +40,7 @@ fn host() -> Result<cpal::Host, String> {
     cpal::host_from_id(HostId::PulseAudio).map_err(|e| format!("PulseAudio is not available: {e}"))
 }
 
-/// Every source, monitors (what's playing) first, the default output's
+/// Every source, outputs (their monitors: what they play) first, the default output's
 /// monitor at the top. Slow-ish (talks to the sound server): call it off the
 /// UI thread.
 pub fn list() -> Vec<SourceInfo> {
@@ -96,21 +96,6 @@ impl Ring {
     /// are drawn, so this moves smoothly enough as it is.
     pub fn now(&self) -> f64 {
         self.written() as f64
-    }
-
-    /// The overview of the last `n` buckets (oldest first), scaled to the
-    /// loudest peak among them; fewer at the start.
-    pub fn waveform(&self, n: usize) -> Vec<(f32, f32)> {
-        let total = self.waves.load(Acquire) as usize;
-        let n = n.min(total).min(WAVE_CAP - 1);
-        let v: Vec<(f32, f32)> = (total - n..total)
-            .map(|i| {
-                let b = self.wave[i % WAVE_CAP].load(Relaxed);
-                (f32::from_bits(b as u32), f32::from_bits((b >> 32) as u32))
-            })
-            .collect();
-        let top = v.iter().fold(0.05f32, |m, w| m.max(w.0));
-        v.into_iter().map(|(p, r)| (p / top, r / top)).collect()
     }
 }
 
@@ -235,7 +220,7 @@ mod tests {
         assert_eq!(ring.sample(10, 1), -10.0);
         assert_eq!(ring.sample(4000, 0), 0.0, "not written yet");
         assert_eq!(ring.sample(-1, 0), 0.0);
-        assert_eq!(ring.waveform(100).len(), 3, "three full buckets");
+        assert_eq!(ring.peaks(100).len(), 3, "three full buckets");
     }
 
     #[test]

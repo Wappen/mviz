@@ -2,7 +2,7 @@
 //!
 //! Usage: mviz [<audio file> | <folder>]
 //!          without one, a start screen opens: open a file or folder, or
-//!          capture what's playing (or an input)
+//!          capture an output (what it plays) or an input
 //!        mviz --render <audio file> <out.mp4> [--start S] [--seconds N] [--size WxH]
 //!          renders a video of the visualizer (with the audio) instead of playing
 //!   right-click   pause / resume (or Space)
@@ -10,7 +10,8 @@
 //!   left-drag     move the window
 //!   double-click  fullscreen on/off (or F11)
 //!   bottom edge   waveform timeline (click or drag to seek)
-//!   right edge    the playlist, when playing a folder (L keeps it open)
+//!   right edge    the playlist, when playing a folder (L keeps it open;
+//!                 S, or a click on its order, changes the order)
 //!   ← / →         previous / next song of the folder
 //!   Tab           the start screen, over the picture
 //!   Ctrl+O        open a file (Ctrl+Shift+O: a folder)
@@ -202,7 +203,7 @@ impl App {
     /// Plays a file, or every song of a folder.
     fn open_path(&mut self, path: PathBuf) {
         if path.is_dir() {
-            match Playlist::scan(&path) {
+            match Playlist::scan(&path, settings::load_sort()) {
                 Ok(pl) => {
                     settings::save_recent(&path);
                     self.play(Arc::new(pl), 0);
@@ -218,7 +219,7 @@ impl App {
 
     /// Plays song `index` of `pl`.
     fn play(&mut self, pl: Arc<Playlist>, index: usize) {
-        let path = pl.songs[index].clone();
+        let path = pl.path(index).to_path_buf();
         let name = song_name(&path);
         self.pending = Some(Pending { rx: spawn_load(path, None), name, origin: Origin { playlist: Some((pl, index)) } });
     }
@@ -229,6 +230,23 @@ impl App {
         let Some((pl, i)) = song.origin.playlist.clone() else { return };
         let j = if step > 0 { pl.next(i) } else { pl.prev(i) };
         self.play(pl, j);
+    }
+
+    /// Plays the folder in its next order (and remembers it). The song
+    /// playing goes on; what follows it is decided again.
+    fn cycle_sort(&mut self) {
+        let Some(Playing { feed: Feed::Song(song), .. }) = &mut self.playing else { return };
+        let Some((pl, pos)) = song.origin.playlist.clone() else { return };
+        let sorted = Arc::new(pl.sorted(pl.sort.next()));
+        settings::save_sort(sorted.sort);
+        if song.player.unqueue() {
+            song.queued = None;
+        } else if let Some(q) = &mut song.queued {
+            // Already playing on into it: just renumber it.
+            q.index = sorted.position_of(&pl, q.index);
+        }
+        song.names = sorted.names();
+        song.origin.playlist = Some((sorted.clone(), sorted.position_of(&pl, pos)));
     }
 
     fn open_dialog(&mut self, folder: bool) {
@@ -360,7 +378,7 @@ impl App {
         if let Some((pl, i)) = song.origin.playlist.clone().filter(|(pl, _)| pl.len() > 1) {
             if song.queued.is_none() && song.tl.is_some() {
                 let j = pl.next(i);
-                let path = pl.songs[j].clone();
+                let path = pl.path(j).to_path_buf();
                 song.queued = Some(Queued { rx: spawn_load(path.clone(), Some(song.player.rate)), index: j, name: song_name(&path), info: None, tl: None });
             }
         }
@@ -441,7 +459,7 @@ impl App {
         let mut paused = false;
         let mut volume = None;
         let mut lengths = Vec::new();
-        let mut playlist_info: Option<(String, usize)> = None;
+        let mut playlist_info: Option<(String, usize, &'static str)> = None;
         let mut home_title = "mviz".to_string();
 
         if let Some(p) = &mut self.playing {
@@ -472,16 +490,14 @@ impl App {
                     if let Some((pl, i)) = &s.origin.playlist {
                         subtitle = format!("{} / {} · {}", i + 1, pl.len(), pl.name);
                         home_title = pl.name.clone();
-                        lengths = pl.lengths.lock().unwrap().clone();
-                        playlist_info = Some((pl.name.clone(), *i));
+                        lengths = pl.lengths();
+                        playlist_info = Some((pl.name.clone(), *i, pl.sort.label()));
                     }
                 }
                 Feed::Live(c) => {
                     title = c.source.name.clone();
                     home_title = c.source.name.clone();
                     subtitle = c.source.kind().to_string();
-                    let n = (ui::LIVE_SECS * c.ring.rate as f64 / capture::WAVE_FRAMES as f64) as usize;
-                    waveform = (c.ring.waveform(n), n);
                 }
             }
         } else {
@@ -511,7 +527,7 @@ impl App {
             waveform: &waveform.0,
             expected: waveform.1,
             volume,
-            playlist: playlist_info.as_ref().map(|(name, i)| ui::PlaylistView { name, songs: &songs, lengths: &lengths, current: *i }),
+            playlist: playlist_info.as_ref().map(|(name, i, sort)| ui::PlaylistView { name, songs: &songs, lengths: &lengths, current: *i, sort }),
         };
         self.ui.draw(&mut scene.ui, &mut scene.texts, &mut measure, &status, now, (w, h));
 
@@ -624,6 +640,7 @@ impl App {
             Key::Named(NamedKey::ArrowRight) => self.skip(1),
             Key::Named(NamedKey::ArrowLeft) => self.skip(-1),
             Key::Character(c) if c.eq_ignore_ascii_case("l") => self.ui.panel_pinned = !self.ui.panel_pinned,
+            Key::Character(c) if c.eq_ignore_ascii_case("s") => self.cycle_sort(),
             _ => {}
         }
     }
@@ -683,14 +700,18 @@ impl ApplicationHandler for App {
                     }
                 }
                 let transport = self.playing.as_mut().map(|p| p.feed.transport());
-                if let Some(ui::Action::Play(i)) = self.ui.button(button, pressed, now, &window, transport, size) {
-                    if let Some(Playing { feed: Feed::Song(s), .. }) = &self.playing {
-                        if let Some((pl, cur)) = s.origin.playlist.clone() {
-                            if i != cur {
-                                self.play(pl, i);
+                match self.ui.button(button, pressed, now, &window, transport, size) {
+                    Some(ui::Action::Play(i)) => {
+                        if let Some(Playing { feed: Feed::Song(s), .. }) = &self.playing {
+                            if let Some((pl, cur)) = s.origin.playlist.clone() {
+                                if i != cur {
+                                    self.play(pl, i);
+                                }
                             }
                         }
                     }
+                    Some(ui::Action::CycleSort) => self.cycle_sort(),
+                    None => {}
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {

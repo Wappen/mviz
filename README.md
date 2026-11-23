@@ -59,7 +59,7 @@ mviz                 # the start screen
 ```
 
 Without a file, mviz opens a start screen: open a file or a folder, reopen the
-last one, or **capture** what the computer is playing (or a microphone) and
+last one, or **capture** an output (whatever it plays) or an input such as a microphone and
 watch it live. Resting on a source shows its input level. Tab brings the same
 screen up over the picture.
 
@@ -74,6 +74,7 @@ The song starts at once (about 40 ms after launch) and loops without a gap.
 | Timeline at the bottom | Shown while the cursor is visible; click or drag to seek |
 | Drop a file or folder on the window | Play it instead |
 | Right edge (folder) | The playlist; click a song to play it (L keeps it open) |
+| S, or the order in the playlist | Play the folder by name, newest first, or shuffled |
 | ← / → | Previous / next song of the folder |
 | Tab | Start screen over the picture |
 | Ctrl+O / Ctrl+Shift+O | Open a file / a folder |

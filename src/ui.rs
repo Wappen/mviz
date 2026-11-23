@@ -6,9 +6,9 @@
 //!   double left-click   fullscreen on/off (and bring to front), or F11
 //!   waveform timeline   at the bottom while the cursor is visible over the
 //!                       window (click or drag on it to seek; live input
-//!                       shows the last 30 s instead)
+//!                       has none, just its name)
 //!   playlist            playing a folder: at the right edge (or L pins it);
-//!                       click a song to play it
+//!                       click a song to play it, or the order to change it
 
 use crate::audio::Player;
 use crate::capture::Capture;
@@ -28,8 +28,6 @@ const DOUBLE_CLICK: f64 = 0.35;
 const DRAG_START: f32 = 4.0;
 /// Touchpad scrolling: pixels per volume step.
 const SCROLL_STEP_PX: f32 = 40.0;
-/// Live input: seconds of overview in the timeline.
-pub const LIVE_SECS: f64 = 30.0;
 
 /// Playlist panel: width of the list, the shade behind it, the edge that
 /// opens it, and its rows.
@@ -98,6 +96,8 @@ pub struct PlaylistView<'a> {
     pub songs: &'a [String],
     pub lengths: &'a [Option<f64>],
     pub current: usize,
+    /// The order, as shown ("by name", …).
+    pub sort: &'a str,
 }
 
 /// What the controls show this frame.
@@ -109,8 +109,7 @@ pub struct Status<'a> {
     /// (position, length) in seconds; `None` for live input.
     pub time: Option<(f64, f64)>,
     /// The overview: (peak, rms) buckets, and how many make up the whole
-    /// timeline. A song fills it from the left as it decodes; live input is
-    /// right-aligned (newest at the right edge).
+    /// song (it fills from the left as it decodes). Live input has none.
     pub waveform: &'a [(f32, f32)],
     pub expected: usize,
     pub volume: Option<f32>,
@@ -121,6 +120,8 @@ pub struct Status<'a> {
 pub enum Action {
     /// Play this song of the playlist.
     Play(usize),
+    /// Play the folder in its next order.
+    CycleSort,
 }
 
 #[derive(PartialEq)]
@@ -216,6 +217,12 @@ impl Ui {
         self.songs > 0 && self.panel_alpha > 0.5 && self.mouse_in && self.mouse.0 > Self::panel_x(w) - 24.0
     }
 
+    /// The cursor is on the playlist's order ("by name", …), right of the song count.
+    fn on_sort(&self, w: f32) -> bool {
+        let (x, y) = self.mouse;
+        self.over_panel(w) && x > Self::panel_x(w) + PANEL_W / 2.0 && (PANEL_TOP + 20.0..PANEL_TOP + 46.0).contains(&y)
+    }
+
     /// The playlist row under the cursor.
     fn panel_hit(&self, size: (f32, f32)) -> Option<usize> {
         let (w, h) = size;
@@ -269,6 +276,8 @@ impl Ui {
                 let duration = transport.as_ref().and_then(|t| t.duration());
                 if let Some(i) = self.panel_hit(size).filter(|_| controls) {
                     return Some(Action::Play(i));
+                } else if controls && self.on_sort(w) {
+                    return Some(Action::CycleSort);
                 } else if controls && self.over_panel(w) {
                     // Inside the playlist but not on a song: nothing.
                 } else if let (Some(t), Some(d), true) = (transport.as_mut(), duration, self.in_zone(h) && self.bar_alpha > 0.3) {
@@ -369,8 +378,9 @@ impl Ui {
 
         let a = self.bar_alpha;
         if a > 0.01 {
-            // Soft shade behind the controls.
-            ui.gradient_v(0.0, h - SHADE, w, SHADE, [0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.6 * a]);
+            // Soft shade behind the controls (lower for live input: no timeline).
+            let shade = if s.time.is_some() { SHADE } else { SHADE * 0.6 };
+            ui.gradient_v(0.0, h - shade, w, shade, [0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.6 * a]);
 
             let mid = h - 12.0 - WAVE_H / 2.0;
             let bar_w = w - 2.0 * PAD;
@@ -380,28 +390,19 @@ impl Ui {
             // Bright = played, dim = still to come; outer part = peak, inner = loudness.
             let step = 3.0;
             let cols = (bar_w / step) as usize;
+            // `expected` buckets make up the whole song; while it is still being
+            // decoded, only the first `waveform.len()` exist yet (it fills in).
             let n = s.expected.max(s.waveform.len()).max(1);
-            // Live input is right-aligned: its newest bucket at the right edge.
-            let offset = if s.time.is_none() { n - s.waveform.len() } else { 0 };
-            for c in 0..cols {
+            for c in (0..cols).filter(|_| played_x.is_some()) {
                 let x = PAD + c as f32 * step;
                 let b0 = ((x - PAD) / bar_w * n as f32) as usize;
-                let b1 = (((x + step - PAD) / bar_w * n as f32) as usize).max(b0 + 1);
-                let (Some(b0), b1) = (b0.checked_sub(offset), b1.saturating_sub(offset)) else { continue };
                 if b0 >= s.waveform.len() {
                     break;
                 }
-                let b1 = b1.clamp(b0 + 1, s.waveform.len());
+                let b1 = (((x + step - PAD) / bar_w * n as f32) as usize).clamp(b0 + 1, s.waveform.len());
                 let (peak, rms) = s.waveform[b0..b1].iter().fold((0.0f32, 0.0f32), |acc, v| (acc.0.max(v.0), acc.1.max(v.1)));
-                let (pa, ra) = match played_x {
-                    Some(px) if x + 1.0 < px => (0.35, 0.9),
-                    Some(_) => (0.12, 0.3),
-                    // Live: older is dimmer.
-                    None => {
-                        let t = 0.4 + 0.6 * (x - PAD) / bar_w;
-                        (0.35 * t, 0.9 * t)
-                    }
-                };
+                let played = played_x.is_some_and(|px| x + 1.0 < px);
+                let (pa, ra) = if played { (0.35, 0.9) } else { (0.12, 0.3) };
                 let ph = (peak * WAVE_H / 2.0).max(0.5);
                 let rh = (rms * WAVE_H / 2.0 * 1.4).min(ph).max(0.5);
                 ui.rect(x, mid - ph, 2.0, ph * 2.0, white(pa * a));
@@ -413,7 +414,8 @@ impl Ui {
 
             // One line: title (and subtitle) on the left; time or "live" on
             // the right, with a pause mark beside it while paused.
-            let title_y = h - 88.0;
+            // Above the timeline; live input (no timeline) sits at the bottom.
+            let title_y = if s.time.is_some() { h - 88.0 } else { h - PAD - 18.0 * 1.3 - 4.0 };
             let small_y = title_y + 3.5;
             let right = match s.time {
                 Some((cur, dur)) => format!("{} / {}", fmt_time(cur), fmt_time(dur)),
@@ -485,6 +487,10 @@ impl Ui {
             count
         };
         text(sub, inner, PANEL_TOP + 26.0, 13.0, white(0.45 * a));
+        // The order, on the right of the same line: click to change it.
+        let sw = measure(pl.sort, 13.0);
+        let sa = if self.on_sort(w) { 0.95 } else { 0.45 };
+        text(pl.sort.to_string(), x0 + PANEL_W - sw, PANEL_TOP + 26.0, 13.0, white(sa * a));
 
         let hover = self.panel_hit(size);
         let rows = Self::panel_rows(h);

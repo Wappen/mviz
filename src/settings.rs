@@ -1,7 +1,8 @@
 //! Settings that persist between runs, in a small text file:
 //! `$XDG_CONFIG_HOME/mviz/settings` (usually `~/.config/mviz/settings`),
 //! one `key=value` per line: the volume, the last file or folder opened
-//! (`recent`) and the last capture source (`capture`).
+//! (`recent`), the last capture source (`capture`) and the playlist order
+//! (`sort`).
 
 use std::path::PathBuf;
 
@@ -87,6 +88,15 @@ pub fn load_capture() -> Option<String> {
 
 pub fn save_capture(id: &str) {
     save("capture", id);
+}
+
+/// The order folders play in.
+pub fn load_sort() -> crate::playlist::Sort {
+    load("sort").and_then(|k| crate::playlist::Sort::from_key(&k)).unwrap_or(crate::playlist::Sort::Name)
+}
+
+pub fn save_sort(sort: crate::playlist::Sort) {
+    save("sort", sort.key());
 }
 
 #[cfg(test)]

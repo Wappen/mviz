@@ -512,6 +512,16 @@ impl Player {
         self.queued = Some(track);
     }
 
+    /// Takes back the queued song (the order changed). Returns false if the
+    /// callback has already moved on to it: `poll_switch` will report that.
+    pub fn unqueue(&mut self) -> bool {
+        let taken = self.shared.next.lock().unwrap().take().is_some();
+        if taken {
+            self.queued = None;
+        }
+        self.queued.is_none()
+    }
+
     /// Checks whether playback has moved on to the queued song; if so it is
     /// now `self.track`, and this returns true (once).
     pub fn poll_switch(&mut self) -> bool {
