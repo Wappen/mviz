@@ -48,6 +48,14 @@ fn carpet(q: f32, power: f32) -> f32 {
 /// `RES_FADE_OCT` octaves either side, so time resolution changes smoothly.
 pub(super) const RES: [(usize, f32); 3] = [(8192, 200.0), (4096, 2000.0), (1024, f32::INFINITY)];
 const RES_FADE_OCT: f32 = 1.0 / 3.0;
+/// Longest time between two analyses (seconds). A frame covers its stretch of
+/// audio with as many evenly spaced analyses as that needs, and its live
+/// light is their average, like a phosphor seeing the light the whole time
+/// the frame lasts: a sound moving fast leaves a continuous trail instead
+/// of a row of separate spots (one per frame), whatever the frame rate.
+const SUB_STEP: f64 = 0.004;
+/// The most analyses for one frame (a stall or a seek is not drawn as motion).
+const MAX_SUB_STEPS: usize = 25;
 
 
 pub fn band_edges() -> Vec<(f32, f32)> {
@@ -163,6 +171,10 @@ pub struct Stereo {
     /// Hz per bin, per resolution.
     pub(super) bin_hz: Vec<f32>,
     last_frame: f64,
+    /// The bins' glows for the last frame (average over its analyses), and
+    /// the window size they were drawn for: kept while paused.
+    field: Batch,
+    field_size: (f32, f32),
     /// Brightness reference in use (0 = not yet set): provisional from what
     /// has played so far until the full analysis arrives, then blended to its
     /// value.
@@ -212,6 +224,8 @@ impl Stereo {
             bins: RES.iter().map(|&(n, _)| vec![Stats::default(); n / 2 + 1]).collect(),
             bin_hz,
             last_frame: f64::NAN,
+            field: Batch::default(),
+            field_size: (0.0, 0.0),
             reference: 0.0,
             provisional: 0.0,
             background: 0.0,
@@ -285,26 +299,47 @@ impl Stereo {
     #[allow(clippy::too_many_arguments)]
     /// `tl` is the full analysis once it has finished (`None` before).
     pub fn draw(&mut self, background: &mut Batch, track: &dyn Samples, rate: u32, frame: f64, dt: f32, tl: Option<&Timeline>, w: f32, h: f32) -> PhosphorFrame {
-        let (advance, bass) = self.step(track, rate, frame, dt, tl);
+        let (advance, bass) = self.step(track, rate, frame, dt, tl, w, h);
         let mut live = Batch::default();
         let tonality = if params::get().bg_noise_white > 0.0 { self.bass_tonality() } else { 1.0 };
         draw_background(background, &mut live, bass.as_ref(), tonality, self.background, w, h);
-        super::field::draw(self, &mut live, w, h);
+        live.append(&self.field);
         PhosphorFrame { live, advance }
     }
 }
 
 impl Stereo {
-    /// Analyses the audio at `frame` (unless paused there: then it returns
-    /// no advance) and measures the background's bass.
-    fn step(&mut self, track: &dyn Samples, rate: u32, frame: f64, dt: f32, tl: Option<&Timeline>) -> (Option<f32>, Option<Bass>) {
+    /// Analyses the audio up to `frame` (unless paused there: then it
+    /// returns no advance), drawing the bins' glows into `self.field`, and
+    /// measures the background's bass.
+    #[allow(clippy::too_many_arguments)]
+    fn step(&mut self, track: &dyn Samples, rate: u32, frame: f64, dt: f32, tl: Option<&Timeline>, w: f32, h: f32) -> (Option<f32>, Option<Bass>) {
         let dt = dt.min(0.1);
         // Paused (same frame): nothing changes, and the phosphor holds still.
         let advance = (frame != self.last_frame).then(|| {
-            self.update(track, frame, dt, tl.map(|t| t.stereo_ref));
+            // The audio since the last analysis, in evenly spaced steps; after
+            // a seek or a stall only `frame` itself.
+            let gap = frame - self.last_frame;
+            let n = (gap / (SUB_STEP * rate as f64)).ceil();
+            let n = if n >= 1.0 && n <= MAX_SUB_STEPS as f64 { n as usize } else { 1 };
+            let mut field = Batch::default();
+            for i in 1..=n {
+                let at = if n == 1 { frame } else { self.last_frame + gap * i as f64 / n as f64 };
+                self.update(track, at, dt / n as f32, tl.map(|t| t.stereo_ref));
+                super::field::draw(self, &mut field, w, h, 1.0 / n as f32);
+            }
+            self.field = field;
+            self.field_size = (w, h);
             self.last_frame = frame;
             dt
         });
+        if self.field_size != (w, h) {
+            // Resized while paused: redraw from the last analysis.
+            let mut field = Batch::default();
+            super::field::draw(self, &mut field, w, h, 1.0);
+            self.field = field;
+            self.field_size = (w, h);
+        }
         // The bass background: from the analysis (once it is there), or for
         // live input measured as it arrives. Both share the field's loudness
         // reference, so the bass lights the background as brightly as it
@@ -397,7 +432,7 @@ mod tests {
             st.update(&track, frame, 1.0 / 60.0, Some(tl.stereo_ref));
             let t1 = std::time::Instant::now();
             let mut out = Batch::default();
-            super::super::field::draw(&st, &mut out, w, h);
+            super::super::field::draw(&st, &mut out, w, h, 1.0);
             glows += out.glows().len();
             grid += t1.elapsed();
             analysis += t1 - t0;
@@ -474,9 +509,8 @@ mod tests {
         let mut prev = vec![0.0f32; cw * ch * 3];
         let mut glow = vec![0.0f32; cw * ch * 3];
         for i in 0..frames {
-            st.update(&track, (start + i as f64 / 60.0) * rate as f64, 1.0 / 60.0, Some(tl.stereo_ref));
-            let mut batch = Batch::default();
-            super::super::field::draw(&st, &mut batch, w, h);
+            st.step(&track, rate, (start + i as f64 / 60.0) * rate as f64, 1.0 / 60.0, Some(&tl), w, h);
+            let batch = &st.field;
             let mut now = vec![0.0f32; cw * ch * 3];
             let s = cw as f32 / w;
             for (cx, cy, rx, ry, c) in batch.glows() {
@@ -536,8 +570,8 @@ mod tests {
         while (f as f64) / 60.0 < secs {
             let t = f as f64 / 60.0;
             let frame = (t * rate as f64).floor();
-            let a = song.step(&track, rate, frame, 1.0 / 60.0, Some(&tl)).1.unwrap();
-            let b = live.step(&track, rate, frame, 1.0 / 60.0, None).1.unwrap();
+            let a = song.step(&track, rate, frame, 1.0 / 60.0, Some(&tl), 1920.0, 1080.0).1.unwrap();
+            let b = live.step(&track, rate, frame, 1.0 / 60.0, None, 1920.0, 1080.0).1.unwrap();
             if t > 20.0 {
                 if let (Some(x), Some(y)) = (b.pc, a.pc) {
                     notes += 1;

@@ -73,6 +73,11 @@ impl Batch {
             .collect()
     }
 
+    /// Adds the shapes of `other` (drawn after this batch's).
+    pub fn append(&mut self, other: &Batch) {
+        self.verts.extend_from_slice(&other.verts);
+    }
+
     pub fn rect(&mut self, x: f32, y: f32, w: f32, h: f32, c: Rgba) {
         self.gradient_h(x, y, w, h, c, c);
     }

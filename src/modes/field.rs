@@ -64,8 +64,9 @@ impl Stage {
 
 }
 
-/// Draws every audible bin as a glow into `out` (the phosphor's live light).
-pub fn draw(st: &Stereo, out: &mut Batch, w: f32, h: f32) {
+/// Draws every audible bin as a glow into `out` (the phosphor's live light),
+/// its light scaled by `weight` (the share of the frame this analysis stands for).
+pub fn draw(st: &Stereo, out: &mut Batch, w: f32, h: f32, weight: f32) {
     let p = params::get();
     let stage = Stage::new(&p, w, h);
     // A glow's radius is about three of its gaussian sigmas.
@@ -94,8 +95,8 @@ pub fn draw(st: &Stereo, out: &mut Batch, w: f32, h: f32) {
             let hz = st.bin_hz[part.res];
             for k in part.k0.max(1)..part.k1.min(sl.len()) {
                 let share = part.weight * (sl[k].norm_sqr() + sr[k].norm_sqr()) / g.energy;
-                let mut light = g.bright * share * density * p.exposure * noise_light;
-                if light < 1e-3 {
+                let mut light = g.bright * share * density * p.exposure * noise_light * weight;
+                if light < 1e-3 * weight {
                     continue;
                 }
                 let f = k as f32 * hz;
