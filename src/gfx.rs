@@ -223,6 +223,8 @@ pub struct Gfx {
 
     blend_hdr_pipe: wgpu::RenderPipeline,
     composite_hdr_pipe: wgpu::RenderPipeline,
+    /// The first halving, which also turns the picture into linear light.
+    down_first_pipe: wgpu::RenderPipeline,
     down_pipe: wgpu::RenderPipeline,
     up_pipe: wgpu::RenderPipeline,
     present_pipe: wgpu::RenderPipeline,
@@ -454,6 +456,7 @@ impl Gfx {
             label: Some("blur"),
             source: wgpu::ShaderSource::Wgsl(BLUR_WGSL.into()),
         });
+        let down_first_pipe = fx_pipe_in(&blur_fx, "down_first", PHOSPHOR_FORMAT, None);
         let down_pipe = fx_pipe_in(&blur_fx, "down", PHOSPHOR_FORMAT, None);
         let up_pipe = fx_pipe_in(&blur_fx, "up", PHOSPHOR_FORMAT, None);
         let present_pipe = fx_pipe_in(&blur_fx, "present", format, None);
@@ -491,6 +494,7 @@ impl Gfx {
             phosphor: None,
             blend_hdr_pipe,
             composite_hdr_pipe,
+            down_first_pipe,
             down_pipe,
             up_pipe,
             present_pipe,
@@ -654,9 +658,10 @@ impl Gfx {
             return;
         }
         // Halve until the smallest level is about 16 px high (a blur about
-        // as wide as a sixth of the window), at most 7 times.
+        // as wide as a sixth of the window), at most 7 times, and at least
+        // once: the first halving is what turns the picture into light.
         let mut dims = vec![size];
-        while dims.len() <= BLUR_LEVELS && dims.last().unwrap().1 > 32 {
+        while dims.len() < 2 || (dims.len() <= BLUR_LEVELS && dims.last().unwrap().1 > 32) {
             let (w, h) = *dims.last().unwrap();
             dims.push(((w / 2).max(1), (h / 2).max(1)));
         }
@@ -691,7 +696,7 @@ impl Gfx {
             })
         };
         let read = views.iter().map(|v| bind(v, v)).collect();
-        let present = bind(&views[0], &views[1.min(views.len() - 1)]);
+        let present = bind(&views[0], &views[1]);
         self.blur = Some(Blur { size, views, read, present });
     }
 
@@ -816,7 +821,7 @@ impl Gfx {
             let n = b.views.len();
             for i in 1..n {
                 let mut pass = begin(&mut encoder, &b.views[i], None);
-                pass.set_pipeline(&self.down_pipe);
+                pass.set_pipeline(if i == 1 { &self.down_first_pipe } else { &self.down_pipe });
                 pass.set_bind_group(0, &b.read[i - 1], &[]);
                 pass.draw(0..3, 0..1);
             }
@@ -1054,16 +1059,46 @@ fn vs(@builtin(vertex_index) i: u32) -> VOut {
     return o;
 }
 
+// The picture is drawn with sRGB-encoded values, but frosted glass averages
+// light: blur in linear light, so bright detail spreads into a glow instead
+// of being dimmed by the dark around it.
+fn to_linear(c: vec3<f32>) -> vec3<f32> {
+    let x = max(c, vec3<f32>(0.0));
+    return select(pow((x + 0.055) / 1.055, vec3<f32>(2.4)), x / 12.92, x <= vec3<f32>(0.04045));
+}
+
+fn to_srgb(c: vec3<f32>) -> vec3<f32> {
+    let x = max(c, vec3<f32>(0.0));
+    return select(1.055 * pow(x, vec3<f32>(1.0 / 2.4)) - 0.055, x * 12.92, x <= vec3<f32>(0.0031308));
+}
+
 // Dual Kawase: half the size, each pixel from five taps of the level above.
+fn down_taps(uv: vec2<f32>, linearize: bool) -> vec3<f32> {
+    let o = 1.0 / vec2<f32>(textureDimensions(src));
+    var t = array<vec3<f32>, 5>(
+        textureSample(src, smp, uv).rgb,
+        textureSample(src, smp, uv + vec2<f32>(-o.x, -o.y)).rgb,
+        textureSample(src, smp, uv + vec2<f32>(o.x, -o.y)).rgb,
+        textureSample(src, smp, uv + vec2<f32>(-o.x, o.y)).rgb,
+        textureSample(src, smp, uv + vec2<f32>(o.x, o.y)).rgb,
+    );
+    if linearize {
+        for (var k = 0; k < 5; k++) {
+            t[k] = to_linear(t[k]);
+        }
+    }
+    return (t[0] * 4.0 + t[1] + t[2] + t[3] + t[4]) / 8.0;
+}
+
+// The first halving reads the encoded picture.
+@fragment
+fn down_first(i: VOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(down_taps(i.uv, true), 1.0);
+}
+
 @fragment
 fn down(i: VOut) -> @location(0) vec4<f32> {
-    let o = 1.0 / vec2<f32>(textureDimensions(src));
-    var c = textureSample(src, smp, i.uv).rgb * 4.0;
-    c += textureSample(src, smp, i.uv + vec2<f32>(-o.x, -o.y)).rgb;
-    c += textureSample(src, smp, i.uv + vec2<f32>(o.x, -o.y)).rgb;
-    c += textureSample(src, smp, i.uv + vec2<f32>(-o.x, o.y)).rgb;
-    c += textureSample(src, smp, i.uv + vec2<f32>(o.x, o.y)).rgb;
-    return vec4<f32>(c / 8.0, 1.0);
+    return vec4<f32>(down_taps(i.uv, false), 1.0);
 }
 
 // ...and back up to twice the size, from eight taps around each pixel.
@@ -1085,7 +1120,7 @@ fn up(i: VOut) -> @location(0) vec4<f32> {
 // little noise (under one 8-bit step) so smooth dark gradients don't band.
 @fragment
 fn present(i: VOut) -> @location(0) vec4<f32> {
-    let c = mix(textureSample(src, smp, i.uv).rgb, textureSample(blurred, smp, i.uv).rgb, p.amount);
+    let c = mix(textureSample(src, smp, i.uv).rgb, to_srgb(textureSample(blurred, smp, i.uv).rgb), p.amount);
     let n = fract(52.9829189 * fract(dot(i.pos.xy, vec2<f32>(0.06711056, 0.00583715))));
     return vec4<f32>(c + (n - 0.5) / 255.0, 1.0);
 }
