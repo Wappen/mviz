@@ -258,6 +258,14 @@ impl Ui {
         self.mouse_in = false;
     }
 
+    /// The window changed size (fullscreen on/off, …). The last cursor
+    /// position was relative to the old size and no motion is reported until
+    /// the cursor moves, so forget it: otherwise a click right after leaving
+    /// fullscreen could land in the new, higher-up timeline zone and seek.
+    pub fn resized(&mut self) {
+        self.mouse_in = false;
+    }
+
     /// A mouse button. Window moves and fullscreen work everywhere; seeking,
     /// pausing and the playlist only with `transport` (something playing,
     /// start screen closed).

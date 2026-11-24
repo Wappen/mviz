@@ -745,7 +745,10 @@ impl ApplicationHandler for App {
         let window = gfx.window().clone();
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(s) => gfx.resize(s.width, s.height),
+            WindowEvent::Resized(s) => {
+                gfx.resize(s.width, s.height);
+                self.ui.resized();
+            }
             WindowEvent::RedrawRequested => self.frame(event_loop),
             // X11: each dragged path is reported on its own.
             WindowEvent::HoveredFile(path) => {
