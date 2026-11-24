@@ -139,8 +139,14 @@ pub(super) struct Live {
     pub energy: f32,
 }
 
-/// Smoothed L², R² and L·conj(R) of a bin: the 2×2 covariance of the two
-/// channels.
+/// Averaged L², R² and L·conj(R) of a bin (per analysis): the 2×2
+/// covariance of the two channels.
+///
+/// A loud hit (a snare) takes over every bin it covers, and while its
+/// direction lingers in the average, the steady sounds sharing those bins
+/// are drawn there too: pulled into the hit. So when the band's sound has
+/// fallen well below its average (the hit is dying away), the level
+/// balance forgets quickly (`forget`): the hit's direction goes with it.
 #[derive(Clone, Copy, Default)]
 pub(super) struct Stats {
     pub l2: f32,
@@ -154,14 +160,36 @@ pub(super) struct Stats {
 }
 
 impl Stats {
-    fn add(&mut self, keep: f32, keep_slow: f32, l: Complex32, r: Complex32) {
+    /// One analysis of the bin. `fading`: how far its band's sound has
+    /// fallen below its average (`Stats::fading`), 0 = not at all.
+    fn add(&mut self, p: &params::Params, dt: f32, fading: f32, l: Complex32, r: Complex32) {
         let (l2, r2, x) = (l.norm_sqr(), r.norm_sqr(), l * r.conj());
-        self.l2 = self.l2 * keep + l2;
-        self.r2 = self.r2 * keep + r2;
-        self.cross = self.cross * keep + x;
-        self.slow_l2 = self.slow_l2 * keep_slow + l2;
-        self.slow_r2 = self.slow_r2 * keep_slow + r2;
-        self.slow_cross = self.slow_cross * keep_slow + x;
+        let fast = (1.0 - fading) / p.smooth.max(1e-3) + fading / p.forget.max(1e-3).min(p.smooth.max(1e-3));
+        let f = 1.0 - (-dt * fast).exp();
+        // Only the level balance forgets: polarity and timing need their
+        // long average to tell a real phase from noise, whatever is playing
+        // (forgetting them too lets bins flicker out of phase).
+        let s = 1.0 - (-dt / p.slow.max(1e-3)).exp();
+        self.l2 += (l2 - self.l2) * f;
+        self.r2 += (r2 - self.r2) * f;
+        self.cross += (x - self.cross) * f;
+        self.slow_l2 += (l2 - self.slow_l2) * s;
+        self.slow_r2 += (r2 - self.slow_r2) * s;
+        self.slow_cross += (x - self.slow_cross) * s;
+    }
+
+    /// How far a band's sound has fallen below its average, from its power
+    /// now and its averaged power: 0 = not (much) below, 1 = `fade_hi` times
+    /// below or more. Judged for the whole band: one bin's power dips by
+    /// itself all the time (noise, beating), a band's much less.
+    fn fading(p: &params::Params, now: f32, avg: f32) -> f32 {
+        if avg <= 0.0 {
+            0.0
+        } else if now <= 0.0 {
+            1.0
+        } else {
+            smoothstep(p.fade_lo, p.fade_hi.max(p.fade_lo + 1e-3), avg / now)
+        }
     }
 
     /// A covariance that has been the same for a long time (tests).
@@ -251,17 +279,23 @@ impl Stereo {
             }
         }
         let p = params::get();
-        let keep = (-dt / p.smooth.max(1e-3)).exp();
-        let keep_slow = (-dt / p.slow.max(1e-3)).exp();
         let fall = 1.0 - (-dt / p.release.max(1e-4)).exp();
         for (g, band) in self.live.iter_mut().zip(&self.bands) {
-            let mut energy = 0.0;
+            let (mut energy, mut old) = (0.0, 0.0);
+            for part in &band.parts {
+                let [sl, sr] = &self.spec[part.res];
+                let bins = &self.bins[part.res];
+                for k in part.k0..part.k1.min(sl.len()) {
+                    energy += part.weight * (sl[k].norm_sqr() + sr[k].norm_sqr());
+                    old += part.weight * (bins[k].l2 + bins[k].r2);
+                }
+            }
+            let fading = Stats::fading(&p, energy, old);
             for part in &band.parts {
                 let [sl, sr] = &self.spec[part.res];
                 let bins = &mut self.bins[part.res];
                 for k in part.k0..part.k1.min(sl.len()) {
-                    energy += part.weight * (sl[k].norm_sqr() + sr[k].norm_sqr());
-                    bins[k].add(keep, keep_slow, sl[k], sr[k]);
+                    bins[k].add(&p, dt, fading, sl[k], sr[k]);
                 }
             }
             g.energy = energy;
@@ -643,6 +677,66 @@ mod tests {
         }
         let k = frames.saturating_sub(60).max(1) as f64;
         println!("from {start} s: mean live {:.5}, glow {:.5}", live / k, glow / k);
+    }
+
+    /// A chord at 0.7 (right) with a loud centred snare every half second:
+    /// where the light in the chord's rows is drawn: at the chord, at the
+    /// snare, and dragged in between, before the first hit, during
+    /// each hit, and in its tail (when the chord should be back in place).
+    /// `cargo test --release snare_over_chord -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn snare_over_chord() {
+        use std::f32::consts::{FRAC_PI_4, TAU};
+        let rate = 48000u32;
+        let (w, h) = (1600.0f32, 1000.0f32);
+        let secs = 4.0;
+        let n = (rate as f32 * secs) as usize;
+        let th = (0.7 + 1.0) * FRAC_PI_4;
+        let mut seed = 1u32;
+        let samples: Vec<f32> = (0..n)
+            .flat_map(|i| {
+                let t = i as f32 / rate as f32;
+                let chord: f32 = [220.0f32, 277.2, 329.6].iter().flat_map(|&f0| (1..=8).map(move |k| (TAU * f0 * k as f32 * t).sin() * 0.03 / k as f32)).sum();
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                let noise = (seed >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0;
+                let since = (t - 1.0).rem_euclid(0.5);
+                let snare = if t >= 1.0 { noise * 0.25 * (-since / 0.05).exp() } else { 0.0 };
+                [chord * th.cos() + snare, chord * th.sin() + snare]
+            })
+            .collect();
+        let track = crate::audio::Track::from_interleaved(&samples, rate);
+        let scale = (h * 0.5).max(w * 0.5 / 1.5);
+        // Only the rows of the chord's partials (the chord's own light).
+        let p = params::get();
+        let rows: Vec<f32> = [220.0f32, 277.2, 329.6].iter().flat_map(|&f0| (1..=8).map(move |k| f0 * k as f32)).map(|f| y_of(&p, f) * h).collect();
+        let mut st = Stereo::new(rate);
+        // [before hits, hit (0–60 ms), tail (100–400 ms)] × [chord, snare, between]
+        let mut acc = [[0.0f64; 3]; 3];
+        for i in 0..(secs * 60.0) as usize {
+            let t = i as f32 / 60.0;
+            let pf = st.draw(&mut Batch::default(), &*track, rate, t as f64 * rate as f64, 1.0 / 60.0, None, w, h);
+            if t < 0.5 {
+                continue;
+            }
+            let since = (t - 1.0).rem_euclid(0.5);
+            let when = if t < 1.0 { 0 } else if since < 0.06 { 1 } else if (0.1..0.4).contains(&since) { 2 } else { continue };
+            for step in &pf.steps {
+                for (x, y, _, _, c) in step.glows() {
+                    if !rows.iter().any(|r| (r - y).abs() < 2.0) {
+                        continue;
+                    }
+                    let pos = (x - w * 0.5) / scale;
+                    let light = (c[3] * (c[0] + c[1] + c[2])) as f64;
+                    let zone = if (pos - 0.7).abs() < 0.15 { 0 } else if pos.abs() < 0.15 { 1 } else if pos > 0.15 && pos < 0.55 { 2 } else { continue };
+                    acc[when][zone] += light;
+                }
+            }
+        }
+        for (name, a) in ["before", "hit", "tail"].iter().zip(acc) {
+            let sum: f64 = a.iter().sum();
+            println!("{name:>10}: chord {:5.1}%  snare {:5.1}%  between {:5.1}%", 100.0 * a[0] / sum, 100.0 * a[1] / sum, 100.0 * a[2] / sum);
+        }
     }
 
     /// Lightness ripple along the trail of a tone panned across the field

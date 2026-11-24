@@ -87,6 +87,12 @@ pub struct Params {
     pub slow: f32,
     /// Level fall time (s); rises are instant.
     pub release: f32,
+    /// Memory (s) of the level balance while a band's sound is far below
+    /// its average (a hit dying away), so the hit's direction goes with it:
+    /// from `fade_lo` times below (not yet) to `fade_hi` (fully).
+    pub forget: f32,
+    pub fade_lo: f32,
+    pub fade_hi: f32,
     /// Arrival-time difference mapped to hard left/right (ms).
     pub max_delay_ms: f32,
     /// Timing used fully below / not at all above (Hz).
@@ -149,6 +155,9 @@ impl Params {
         smooth: 0.1,
         slow: 0.4,
         release: 0.025,
+        forget: 0.015,
+        fade_lo: 1.3,
+        fade_hi: 3.0,
         max_delay_ms: 0.7,
         delay_fade_lo: 500.0,
         delay_fade_hi: 700.0,
