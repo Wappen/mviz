@@ -991,7 +991,49 @@ fn corner_light(uv: vec2<f32>) -> vec3<f32> {
 }
 "#;
 
-const PHOSPHOR_WGSL: &str = r#"
+/// WGSL shared by the full-screen passes: smooth upscaling and dither.
+macro_rules! filter_wgsl {
+    () => {
+        r#"
+// A texture read at `uv` through a cubic B-spline instead of bilinearly:
+// smooth (no kinks every texel, which the eye sees as faint ridges) and
+// never negative (no dark rims around bright light, unlike bicubic
+// interpolation). Four bilinear reads, each placed to weigh its 2×2 texels
+// by the spline. `smp` must filter linearly and clamp to the edge.
+fn smooth_sample(t: texture_2d<f32>, uv: vec2<f32>) -> vec3<f32> {
+    let size = vec2<f32>(textureDimensions(t));
+    let q = uv * size - 0.5;
+    let f = fract(q);
+    let base = floor(q) + 0.5;
+    let f2 = f * f;
+    let f3 = f2 * f;
+    let w0 = (1.0 - 3.0 * f + 3.0 * f2 - f3) / 6.0;
+    let w1 = (4.0 - 6.0 * f2 + 3.0 * f3) / 6.0;
+    let w2 = (1.0 + 3.0 * f + 3.0 * f2 - 3.0 * f3) / 6.0;
+    let w3 = f3 / 6.0;
+    let g0 = w0 + w1;
+    let g1 = w2 + w3;
+    let a = (base - 1.0 + w1 / g0) / size;
+    let b = (base + 1.0 + w3 / g1) / size;
+    return g0.y * (g0.x * textureSample(t, smp, a).rgb + g1.x * textureSample(t, smp, vec2<f32>(b.x, a.y)).rgb)
+         + g1.y * (g0.x * textureSample(t, smp, vec2<f32>(a.x, b.y)).rgb + g1.x * textureSample(t, smp, b).rgb);
+}
+
+// Noise of up to one 8-bit step either way (triangular, so it adds no
+// visible grain of its own), for the last pass before an 8-bit screen:
+// smooth dark gradients then show no bands.
+fn dither(pos: vec2<f32>) -> f32 {
+    let n1 = fract(52.9829189 * fract(dot(pos, vec2<f32>(0.06711056, 0.00583715))));
+    let n2 = fract(52.9829189 * fract(dot(pos + vec2<f32>(37.0, 17.0), vec2<f32>(0.06711056, 0.00583715))));
+    return (n1 + n2 - 1.0) / 255.0;
+}
+"#
+    };
+}
+
+const PHOSPHOR_WGSL: &str = concat!(
+    filter_wgsl!(),
+    r#"
 struct Params { keep: f32, knee: f32, texel: vec2<f32> };
 @group(0) @binding(0) var glow: texture_2d<f32>;
 // update: previous dots; composite: current dots
@@ -1033,18 +1075,22 @@ fn copy(i: VOut) -> @location(0) vec4<f32> {
 }
 
 // shown = live + glow, rolled off softly above 0.8 so bright overlaps
-// compress instead of clipping.
+// compress instead of clipping. The textures are smaller than the window:
+// scaled up smoothly, and dithered for the 8-bit screen.
 @fragment
 fn composite(i: VOut) -> @location(0) vec4<f32> {
-    let c = textureSample(glow, smp, i.uv).rgb + textureSample(live, smp, i.uv).rgb;
+    let c = smooth_sample(glow, i.uv) + smooth_sample(live, i.uv);
     let knee = p.knee;
     let over = max(c - vec3<f32>(knee), vec3<f32>(0.0));
     let soft = vec3<f32>(knee) + (1.0 - knee) * (vec3<f32>(1.0) - exp(-over / (1.0 - knee)));
-    return vec4<f32>(select(c, soft, c > vec3<f32>(knee)), 1.0);
+    return vec4<f32>(select(c, soft, c > vec3<f32>(knee)) + dither(i.pos.xy), 1.0);
 }
-"#;
+"#
+);
 
-const BLUR_WGSL: &str = r#"
+const BLUR_WGSL: &str = concat!(
+    filter_wgsl!(),
+    r#"
 struct Params { amount: f32, pad: f32, pad2: vec2<f32> };
 // down / up: the level read; present: the sharp picture
 @group(0) @binding(0) var src: texture_2d<f32>;
@@ -1121,12 +1167,12 @@ fn up(i: VOut) -> @location(0) vec4<f32> {
     return vec4<f32>(c / 12.0, 1.0);
 }
 
-// The sharp picture blended into the blurred one by `amount`, with a
-// little noise (under one 8-bit step) so smooth dark gradients don't band.
+// The sharp picture blended into the blurred one (half the size, scaled
+// up smoothly) by `amount`, dithered for the 8-bit screen.
 @fragment
 fn present(i: VOut) -> @location(0) vec4<f32> {
-    let c = mix(textureSample(src, smp, i.uv).rgb, to_srgb(textureSample(blurred, smp, i.uv).rgb), p.amount);
-    let n = fract(52.9829189 * fract(dot(i.pos.xy, vec2<f32>(0.06711056, 0.00583715))));
-    return vec4<f32>(c + (n - 0.5) / 255.0, 1.0);
+    let c = mix(textureSample(src, smp, i.uv).rgb, to_srgb(smooth_sample(blurred, i.uv)), p.amount);
+    return vec4<f32>(c + dither(i.pos.xy), 1.0);
 }
-"#;
+"#
+);
