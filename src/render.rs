@@ -171,4 +171,38 @@ mod preview {
             }
         }
     }
+
+    /// GPU time per frame for the field at 4K (`MVIZ_SIZE` to change),
+    /// 2 s from 1:30 of `MVIZ_FILE`, waiting for the GPU after each frame.
+    /// `MVIZ_FILE=song.mp3 cargo test --release gpu_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn gpu_cost() {
+        let song = std::env::var("MVIZ_FILE").expect("set MVIZ_FILE");
+        let (w, h) = std::env::var("MVIZ_SIZE").ok().and_then(|v| v.split_once('x').map(|(a, b)| (a.parse().unwrap(), b.parse().unwrap()))).unwrap_or((3840u32, 2160u32));
+        let mut gfx = Gfx::new_offscreen(w, h);
+        let source = Source::open(std::path::Path::new(&song)).unwrap();
+        let rate = source.rate;
+        let track = source.track(rate);
+        source.decode_into(track.clone()).unwrap();
+        let tl = analysis::analyze(&track, &AtomicU32::new(0));
+        let mut stereo = Stereo::new(rate);
+        let dt = 1.0 / 60.0;
+        let (mut cpu, mut gpu) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+        let frames = 120;
+        for i in 0..frames + 30 {
+            let t0 = std::time::Instant::now();
+            let mut scene = Scene { clear: modes::base(), ..Default::default() };
+            scene.phosphor = Some(stereo.draw(&mut scene.background, &track, rate, (90.0 + i as f64 * dt) * rate as f64, dt as f32, Some(&tl), w as f32, h as f32));
+            let t1 = std::time::Instant::now();
+            gfx.render(scene);
+            gfx.wait();
+            // The first half second warms up (shaders, buffers).
+            if i >= 30 {
+                cpu += t1 - t0;
+                gpu += t1.elapsed();
+            }
+        }
+        println!("{w}x{h}: per frame analysis+glows {:?}, render (to GPU done) {:?}", cpu / frames, gpu / frames);
+    }
 }

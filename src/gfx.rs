@@ -15,9 +15,11 @@ pub type Rgba = [f32; 4];
 pub static FONT_BYTES: &[u8] = include_bytes!("../assets/NotoSans-Regular.ttf");
 const FONT_FAMILY: &str = "Noto Sans";
 
-/// Phosphor afterglow. Per pixel, every frame:
+/// Phosphor afterglow. Per pixel, at every analysis step (a few per frame,
+/// see `PhosphorFrame::steps`):
 ///   glow  = blur(glow) · e^(−dt/fade) + max(previous live − live, 0)
-///   shown = live + glow
+/// and per frame
+///   shown = live (averaged over the frame's steps) + glow
 /// The live light (the dots) is shown as it is; whatever light leaves a
 /// pixel (a sound stopping, getting quieter or moving away) stays in the
 /// texture and fades there, fast then slowly, spreading a little. So moving
@@ -25,7 +27,11 @@ const FONT_FAMILY: &str = "Noto Sans";
 /// step, a steady sound does not pile up, and all light adds like light.
 /// Only flicker feeds the glow while a sound holds; the fade time
 /// (`params::Params::fade`) is the lever if that gets too bright. The blur
-/// per frame (`fade_blur`) lets fading light spread out.
+/// (`fade_blur` per 1/60 s, see `blur_offset`) lets fading light spread out.
+/// Taking light per step rather than per frame matters for moving light: the
+/// glow takes what a pixel lost, which adds up to the brightest it got, and
+/// a spot averaged over a frame's travel is dimmer where two frames meet, so
+/// fast trails would show a ridge per frame.
 /// The phosphor textures are this fraction of the window size (it is all soft glow).
 const PHOSPHOR_SCALE: f32 = 0.5;
 /// Most halvings of the picture when blurring.
@@ -71,11 +77,6 @@ impl Batch {
                 ((a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5, (b[0] - a[0]) * 0.5, (b[1] - a[1]) * 0.5, q[0].color)
             })
             .collect()
-    }
-
-    /// Adds the shapes of `other` (drawn after this batch's).
-    pub fn append(&mut self, other: &Batch) {
-        self.verts.extend_from_slice(&other.verts);
     }
 
     pub fn rect(&mut self, x: f32, y: f32, w: f32, h: f32, c: Rgba) {
@@ -133,10 +134,33 @@ pub struct Text {
 
 /// The phosphor part of a frame (stereo modes).
 pub struct PhosphorFrame {
-    /// What is lit right now.
+    /// Lit throughout the frame (light that changes too slowly to differ
+    /// between its steps): drawn once.
     pub live: Batch,
+    /// What else is lit at each of the frame's analyses, evenly spaced over
+    /// it (none: only `live`). The phosphor takes each in turn, so light
+    /// that leaves a pixel goes into the glow when it leaves, not at the
+    /// frame's end; shown is their average. Only small, fast light belongs
+    /// here: every step draws it again.
+    pub steps: Vec<Batch>,
     /// Seconds to advance the phosphor; `None` = paused (show it unchanged).
     pub advance: Option<f32>,
+}
+
+/// The offset (phosphor pixels) of the glow's spreading cross of bilinear
+/// reads for one step of `dt` seconds, spreading as much per second as one
+/// read `per_frame` out does per 1/60 s. A read at offset o puts its weight
+/// on the two pixels around o, so its spread (second moment) is
+/// m(o) = (1 − f)·i² + f·(i + 1)² with i = ⌊o⌋, f = o − i; spreads add up
+/// over steps.
+pub fn blur_offset(per_frame: f32, dt: f32) -> f32 {
+    let m = |o: f32| {
+        let (i, f) = (o.floor(), o.fract());
+        (1.0 - f) * i * i + f * (i + 1.0) * (i + 1.0)
+    };
+    let t = m(per_frame.max(0.0)) * dt * 60.0;
+    let i = t.sqrt().floor();
+    i + (t - i * i) / (2.0 * i + 1.0)
 }
 
 /// Everything one frame shows, back to front.
@@ -158,16 +182,22 @@ pub struct Scene {
 
 struct Phosphor {
     size: (u32, u32),
-    /// This frame's and last frame's dots, used in turn.
+    /// This step's and the last step's dots (`PhosphorFrame::steps`), used in turn.
     live: [wgpu::TextureView; 2],
+    /// This frame's and the last frame's light lit throughout (`PhosphorFrame::live`).
+    slow: [wgpu::TextureView; 2],
     glow: [wgpu::TextureView; 2],
-    /// Which `live` / `glow` hold the latest state.
+    /// The live light shown: the average over the last frame's steps.
+    shown: wgpu::TextureView,
+    /// Which `live` / `slow` / `glow` hold the latest state.
     cur_live: usize,
+    cur_slow: usize,
     cur_glow: usize,
-    /// update_bg[g][l]: reads glow g, previous live 1-l, new live l.
-    update_bg: [[wgpu::BindGroup; 2]; 2],
-    /// composite_bg[g][l]: shows glow g + live l.
-    composite_bg: [[wgpu::BindGroup; 2]; 2],
+    /// update_bg[g][l][a][b]: reads glow g, previous live 1-l, new live l,
+    /// previous slow a, new slow b.
+    update_bg: [[[[wgpu::BindGroup; 2]; 2]; 2]; 2],
+    /// composite_bg[g]: shows glow g + `shown`.
+    composite_bg: [wgpu::BindGroup; 2],
 }
 
 /// Blurring: the picture drawn into `scene` (full size), then halved into
@@ -218,6 +248,7 @@ pub struct Gfx {
     vcap: u64,
 
     fx_layout: wgpu::BindGroupLayout,
+    update_layout: wgpu::BindGroupLayout,
     fx_params: wgpu::Buffer,
     sampler: wgpu::Sampler,
     update_pipe: wgpu::RenderPipeline,
@@ -416,6 +447,22 @@ impl Gfx {
                 },
             ],
         });
+        let sampler_entry = wgpu::BindGroupLayoutEntry {
+            binding: 3,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            count: None,
+        };
+        let params_entry = wgpu::BindGroupLayoutEntry {
+            binding: 4,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+            count: None,
+        };
+        let update_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("phosphor update"),
+            entries: &[tex_entry(0), tex_entry(1), tex_entry(2), sampler_entry, params_entry, tex_entry(5), tex_entry(6)],
+        });
         let fx_params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("phosphor params"),
             size: std::mem::size_of::<FxParams>() as u64,
@@ -451,7 +498,34 @@ impl Gfx {
             })
         };
         let fx_pipe = |entry: &str, target: wgpu::TextureFormat, blend: Option<wgpu::BlendState>| fx_pipe_in(&fx, entry, target, blend);
-        let update_pipe = fx_pipe("update", PHOSPHOR_FORMAT, None);
+        // The update writes the new glow, and adds its step's share (the
+        // blend constant) of the live light to what is shown.
+        let share = wgpu::BlendState {
+            color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Constant, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
+            alpha: additive.alpha,
+        };
+        let update_pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("update"),
+            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                bind_group_layouts: &[Some(&update_layout)],
+                ..Default::default()
+            })),
+            vertex: wgpu::VertexState { module: &fx, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
+            fragment: Some(wgpu::FragmentState {
+                module: &fx,
+                entry_point: Some("update"),
+                targets: &[
+                    Some(wgpu::ColorTargetState { format: PHOSPHOR_FORMAT, blend: None, write_mask: wgpu::ColorWrites::ALL }),
+                    Some(wgpu::ColorTargetState { format: PHOSPHOR_FORMAT, blend: Some(share), write_mask: wgpu::ColorWrites::ALL }),
+                ],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            cache: None,
+            multiview_mask: None,
+        });
         let composite_pipe = fx_pipe("composite", format, Some(additive));
         let copy_pipe = fx_pipe("copy", PHOSPHOR_FORMAT, None);
         let composite_hdr_pipe = fx_pipe("composite", PHOSPHOR_FORMAT, Some(additive));
@@ -491,6 +565,7 @@ impl Gfx {
             vbuf,
             vcap,
             fx_layout,
+            update_layout,
             fx_params,
             sampler,
             update_pipe,
@@ -552,6 +627,12 @@ impl Gfx {
     }
 
     /// The last rendered frame as RGBA bytes, row by row (offscreen only).
+    /// Waits until the GPU has finished everything submitted (timing).
+    #[cfg(test)]
+    pub fn wait(&self) {
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+    }
+
     pub fn read_frame(&self) -> Vec<u8> {
         let Output::Offscreen { texture } = &self.output else { return Vec::new() };
         let (w, h) = (self.config.width, self.config.height);
@@ -621,7 +702,9 @@ impl Gfx {
                 .create_view(&Default::default())
         };
         let live = [texture("live a"), texture("live b")];
+        let slow = [texture("slow a"), texture("slow b")];
         let glow = [texture("glow a"), texture("glow b")];
+        let shown = texture("shown");
         let bind = |a: &wgpu::TextureView, b: &wgpu::TextureView, c: &wgpu::TextureView| {
             self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("phosphor"),
@@ -635,17 +718,39 @@ impl Gfx {
                 ],
             })
         };
-        let update_bg = [0, 1].map(|g| [0, 1].map(|l| bind(&glow[g], &live[1 - l], &live[l])));
-        let composite_bg = [0, 1].map(|g| [0, 1].map(|l| bind(&glow[g], &live[l], &live[l])));
+        let update_bg = [0, 1].map(|g| {
+            [0, 1].map(|l| {
+                [0, 1].map(|a| {
+                    [0, 1].map(|b| {
+                        let tex = |binding, view| wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::TextureView(view) };
+                        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("phosphor update"),
+                            layout: &self.update_layout,
+                            entries: &[
+                                tex(0, &glow[g]),
+                                tex(1, &live[1 - l]),
+                                tex(2, &live[l]),
+                                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                                wgpu::BindGroupEntry { binding: 4, resource: self.fx_params.as_entire_binding() },
+                                tex(5, &slow[a]),
+                                tex(6, &slow[b]),
+                            ],
+                        })
+                    })
+                })
+            })
+        });
+        let composite_bg = [0, 1].map(|g| bind(&glow[g], &shown, &shown));
         // New textures start black...
         let mut encoder = self.device.create_command_encoder(&Default::default());
-        for view in live.iter().chain(&glow) {
+        for view in live.iter().chain(&slow).chain(&glow).chain([&shown]) {
             clear_pass(&mut encoder, view, wgpu::Color::BLACK);
         }
         // ...or, on a resize, with the old picture scaled to the new size, so
         // nothing is lost (while paused nothing new is drawn into them).
         if let Some(old) = self.phosphor.take() {
-            for (src, dst) in [(&old.live[old.cur_live], &live[0]), (&old.glow[old.cur_glow], &glow[0])] {
+            let pairs = [(&old.live[old.cur_live], &live[0]), (&old.slow[old.cur_slow], &slow[0]), (&old.glow[old.cur_glow], &glow[0]), (&old.shown, &shown)];
+            for (src, dst) in pairs {
                 let bg = bind(src, src, src);
                 let mut pass = begin(&mut encoder, dst, None);
                 pass.set_pipeline(&self.copy_pipe);
@@ -654,7 +759,7 @@ impl Gfx {
             }
         }
         self.queue.submit(Some(encoder.finish()));
-        self.phosphor = Some(Phosphor { size, live, glow, cur_live: 0, cur_glow: 0, update_bg, composite_bg });
+        self.phosphor = Some(Phosphor { size, live, slow, glow, shown, cur_live: 0, cur_slow: 0, cur_glow: 0, update_bg, composite_bg });
     }
 
     fn ensure_blur(&mut self) {
@@ -732,15 +837,19 @@ impl Gfx {
         self.queue.write_buffer(&self.globals, 0, bytemuck::cast_slice(&[w, h, (scene.time % 10_000.0) as f32, 0.0]));
 
         // All shapes go into one vertex buffer; remember each layer's range.
-        let empty = Batch::default();
-        let live = scene.phosphor.as_ref().map_or(&empty, |p| &p.live);
-        let layers = [&scene.background, live, &scene.ui];
+        // Layers: background, ui, then the phosphor's light lit throughout
+        // and at each step.
+        let mut layers = vec![&scene.background, &scene.ui];
+        if let Some(p) = &scene.phosphor {
+            layers.push(&p.live);
+            layers.extend(&p.steps);
+        }
         let total: usize = layers.iter().map(|b| b.verts.len()).sum();
         if total as u64 > self.vcap {
             self.vcap = (total as u64).next_power_of_two();
             self.vbuf = Self::vertex_buffer(&self.device, self.vcap);
         }
-        let mut ranges: [std::ops::Range<u32>; 3] = std::array::from_fn(|_| 0..0);
+        let mut ranges = vec![0..0; layers.len()];
         let mut offset = 0u32;
         for (i, layer) in layers.iter().enumerate() {
             let n = layer.verts.len() as u32;
@@ -773,37 +882,71 @@ impl Gfx {
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
 
-        // Phosphor: draw this frame's dots, then
-        // glow = blur(glow)·keep + max(previous dots − dots, 0).
+        // Phosphor: this frame's light lit throughout (`slow`), then for each
+        // step its dots (`live`), and
+        // glow = blur(glow)·keep + max(previous slow + live − slow − live, 0),
+        // while adding the step's share of slow + live to what is shown. The
+        // slow light only changes at a frame's first step: in later ones the
+        // update reads the new slow light as both before and after.
         let mut composite = None;
         if let Some(pf) = &scene.phosphor {
             self.ensure_phosphor();
             let p = self.phosphor.as_mut().unwrap();
+            let always = ranges[2].clone();
+            // Without steps: one, with only the slow light.
+            let steps: Vec<_> = if pf.steps.is_empty() { std::iter::once(0..0).collect() } else { ranges[3..].to_vec() };
+            let n = steps.len();
             // Written every frame, so the knee also changes while paused.
             let cfg = crate::params::get();
+            let dt = pf.advance.unwrap_or(0.0) / n as f32;
+            let o = blur_offset(cfg.fade_blur, dt);
             let params = FxParams {
-                keep: pf.advance.map_or(1.0, |dt| (-dt / cfg.fade.max(1e-3)).exp()),
+                keep: (-dt / cfg.fade.max(1e-3)).exp(),
                 knee: cfg.knee.clamp(0.05, 0.99),
-                texel: [cfg.fade_blur / p.size.0 as f32, cfg.fade_blur / p.size.1 as f32],
+                texel: [o / p.size.0 as f32, o / p.size.1 as f32],
             };
             self.queue.write_buffer(&self.fx_params, 0, bytemuck::bytes_of(&params));
             if pf.advance.is_some() {
-                let live = 1 - p.cur_live;
+                let slow = 1 - p.cur_slow;
                 {
-                    let mut pass = begin(&mut encoder, &p.live[live], Some(wgpu::Color::BLACK));
-                    draw_range(&mut pass, &self.add_hdr_pipe, &self.globals_bg, &self.vbuf, ranges[1].clone());
+                    let mut pass = begin(&mut encoder, &p.slow[slow], Some(wgpu::Color::BLACK));
+                    draw_range(&mut pass, &self.add_hdr_pipe, &self.globals_bg, &self.vbuf, always);
                 }
-                let glow = 1 - p.cur_glow;
-                {
-                    let mut pass = begin(&mut encoder, &p.glow[glow], None);
-                    pass.set_pipeline(&self.update_pipe);
-                    pass.set_bind_group(0, &p.update_bg[p.cur_glow][live], &[]);
-                    pass.draw(0..3, 0..1);
+                let share = 1.0 / n as f64;
+                for (i, step) in steps.into_iter().enumerate() {
+                    let live = 1 - p.cur_live;
+                    {
+                        let mut pass = begin(&mut encoder, &p.live[live], Some(wgpu::Color::BLACK));
+                        draw_range(&mut pass, &self.add_hdr_pipe, &self.globals_bg, &self.vbuf, step);
+                    }
+                    let glow = 1 - p.cur_glow;
+                    {
+                        let target = |view, load| {
+                            Some(wgpu::RenderPassColorAttachment {
+                                view,
+                                depth_slice: None,
+                                resolve_target: None,
+                                ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
+                            })
+                        };
+                        let shown_load = if i == 0 { wgpu::LoadOp::Clear(wgpu::Color::BLACK) } else { wgpu::LoadOp::Load };
+                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("phosphor update"),
+                            color_attachments: &[target(&p.glow[glow], wgpu::LoadOp::Clear(wgpu::Color::BLACK)), target(&p.shown, shown_load)],
+                            ..Default::default()
+                        });
+                        pass.set_pipeline(&self.update_pipe);
+                        pass.set_blend_constant(wgpu::Color { r: share, g: share, b: share, a: share });
+                        let before = if i == 0 { p.cur_slow } else { slow };
+                        pass.set_bind_group(0, &p.update_bg[p.cur_glow][live][before][slow], &[]);
+                        pass.draw(0..3, 0..1);
+                    }
+                    p.cur_live = live;
+                    p.cur_glow = glow;
                 }
-                p.cur_live = live;
-                p.cur_glow = glow;
+                p.cur_slow = slow;
             }
-            composite = Some((p.cur_glow, p.cur_live));
+            composite = Some(p.cur_glow);
         }
 
         let c = scene.clear;
@@ -817,9 +960,9 @@ impl Gfx {
             {
                 let mut pass = begin(&mut encoder, &b.views[0], Some(clear));
                 draw_range(&mut pass, &self.blend_hdr_pipe, &self.globals_bg, &self.vbuf, ranges[0].clone());
-                if let (Some((g, l)), Some(p)) = (composite, &self.phosphor) {
+                if let (Some(g), Some(p)) = (composite, &self.phosphor) {
                     pass.set_pipeline(&self.composite_hdr_pipe);
-                    pass.set_bind_group(0, &p.composite_bg[g][l], &[]);
+                    pass.set_bind_group(0, &p.composite_bg[g], &[]);
                     pass.draw(0..3, 0..1);
                 }
             }
@@ -845,13 +988,13 @@ impl Gfx {
                 pass.draw(0..3, 0..1);
             } else {
                 draw_range(&mut pass, &self.blend_pipe, &self.globals_bg, &self.vbuf, ranges[0].clone());
-                if let (Some((g, l)), Some(p)) = (composite, &self.phosphor) {
+                if let (Some(g), Some(p)) = (composite, &self.phosphor) {
                     pass.set_pipeline(&self.composite_pipe);
-                    pass.set_bind_group(0, &p.composite_bg[g][l], &[]);
+                    pass.set_bind_group(0, &p.composite_bg[g], &[]);
                     pass.draw(0..3, 0..1);
                 }
             }
-            draw_range(&mut pass, &self.blend_pipe, &self.globals_bg, &self.vbuf, ranges[2].clone());
+            draw_range(&mut pass, &self.blend_pipe, &self.globals_bg, &self.vbuf, ranges[1].clone());
             let _ = self.text_renderer.render(&self.atlas, &self.viewport, &mut pass);
         }
 
@@ -1055,17 +1198,26 @@ fn vs(@builtin(vertex_index) i: u32) -> VOut {
     return o;
 }
 
-// glow' = blur(glow) · keep + light that left this pixel
+// slow: what is lit throughout the frame, before and now (see `render`)
+@group(0) @binding(5) var slow_before: texture_2d<f32>;
+@group(0) @binding(6) var slow_now: texture_2d<f32>;
+
+struct Update { @location(0) glow: vec4<f32>, @location(1) shown: vec4<f32> };
+
+// glow' = blur(glow) · keep + light that left this pixel; and the light now
+// lit, for what is shown (scaled by the step's share in the blending).
 @fragment
-fn update(i: VOut) -> @location(0) vec4<f32> {
+fn update(i: VOut) -> Update {
     let o = p.texel;
     let blurred = textureSample(glow, smp, i.uv).rgb * 0.5
         + (textureSample(glow, smp, i.uv + vec2<f32>(o.x, 0.0)).rgb
          + textureSample(glow, smp, i.uv - vec2<f32>(o.x, 0.0)).rgb
          + textureSample(glow, smp, i.uv + vec2<f32>(0.0, o.y)).rgb
          + textureSample(glow, smp, i.uv - vec2<f32>(0.0, o.y)).rgb) * 0.125;
-    let lost = max(textureSample(live, smp, i.uv).rgb - textureSample(live_now, smp, i.uv).rgb, vec3<f32>(0.0));
-    return vec4<f32>(blurred * p.keep + lost, 1.0);
+    let before = textureSample(live, smp, i.uv).rgb + textureSample(slow_before, smp, i.uv).rgb;
+    let now = textureSample(live_now, smp, i.uv).rgb + textureSample(slow_now, smp, i.uv).rgb;
+    let lost = max(before - now, vec3<f32>(0.0));
+    return Update(vec4<f32>(blurred * p.keep + lost, 1.0), vec4<f32>(now, 1.0));
 }
 
 // A texture copied (and rescaled) as it is.
@@ -1176,3 +1328,24 @@ fn present(i: VOut) -> @location(0) vec4<f32> {
 }
 "#
 );
+
+#[cfg(test)]
+mod tests {
+    use super::blur_offset;
+
+    #[test]
+    fn glow_spreads_as_much_per_second_in_any_steps() {
+        // One step of a 60th of a second is the offset as given.
+        for o in [0.0, 0.5, 1.0, 1.2, 2.7] {
+            assert!((blur_offset(o, 1.0 / 60.0) - o).abs() < 1e-5, "{o}");
+        }
+        // Four steps spread as one 1/60 s step would (second moments add).
+        let m = |o: f32| {
+            let (i, f) = (o.floor(), o.fract());
+            (1.0 - f) * i * i + f * (i + 1.0) * (i + 1.0)
+        };
+        let quarter = blur_offset(1.2, 1.0 / 240.0);
+        assert!((4.0 * m(quarter) - m(1.2)).abs() < 1e-5, "{quarter}");
+        assert!(blur_offset(1.2, 1.0 / 30.0) > 1.2);
+    }
+}

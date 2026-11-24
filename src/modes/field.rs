@@ -64,9 +64,9 @@ impl Stage {
 
 }
 
-/// Draws every audible bin as a glow into `out` (the phosphor's live light),
-/// its light scaled by `weight` (the share of the frame this analysis stands for).
-pub fn draw(st: &Stereo, out: &mut Batch, w: f32, h: f32, weight: f32) {
+/// Draws every audible bin measured with an FFT size `res` for which
+/// `which(res)` holds as a glow into `out` (the phosphor's live light).
+pub fn draw(st: &Stereo, out: &mut Batch, w: f32, h: f32, which: impl Fn(usize) -> bool) {
     let p = params::get();
     let stage = Stage::new(&p, w, h);
     // A glow's radius is about three of its gaussian sigmas.
@@ -90,13 +90,13 @@ pub fn draw(st: &Stereo, out: &mut Batch, w: f32, h: f32, weight: f32) {
         let tone = if p.noise_white > 0.0 || p.noise_dim > 0.0 { tonality(st, band) } else { 1.0 };
         let saturation = p.saturation * (1.0 - p.noise_white * (1.0 - tone));
         let noise_light = 1.0 - p.noise_dim * (1.0 - tone);
-        for part in &band.parts {
+        for part in band.parts.iter().filter(|p| which(p.res)) {
             let [sl, sr] = &st.spec[part.res];
             let hz = st.bin_hz[part.res];
             for k in part.k0.max(1)..part.k1.min(sl.len()) {
                 let share = part.weight * (sl[k].norm_sqr() + sr[k].norm_sqr()) / g.energy;
-                let mut light = g.bright * share * density * p.exposure * noise_light * weight;
-                if light < 1e-3 * weight {
+                let mut light = g.bright * share * density * p.exposure * noise_light;
+                if light < 1e-3 {
                     continue;
                 }
                 let f = k as f32 * hz;

@@ -73,9 +73,11 @@ pub struct Params {
     pub knee: f32,
 
     // --- Afterglow ---
-    /// Afterglow time constant (s).
+    /// Afterglow time constant (s). 0.25 when the phosphor took all light
+    /// once per frame; taking the treble at every analysis step also catches
+    /// its flicker within a frame, so 0.19 keeps the glow as bright as it was.
     pub fade: f32,
-    /// Spread of fading light per frame (phosphor pixels).
+    /// Spread of fading light per 1/60 s (phosphor pixels, see `gfx::blur_offset`).
     pub fade_blur: f32,
 
     // --- Placement ---
@@ -142,7 +144,7 @@ impl Params {
         tone_hi_db: 8.0,
         noise_dim: 0.5,
         knee: 0.8,
-        fade: 0.25,
+        fade: 0.19,
         fade_blur: 1.2,
         smooth: 0.1,
         slow: 0.4,

@@ -49,11 +49,21 @@ fn carpet(q: f32, power: f32) -> f32 {
 pub(super) const RES: [(usize, f32); 3] = [(8192, 200.0), (4096, 2000.0), (1024, f32::INFINITY)];
 const RES_FADE_OCT: f32 = 1.0 / 3.0;
 /// Longest time between two analyses (seconds). A frame covers its stretch of
-/// audio with as many evenly spaced analyses as that needs, and its live
-/// light is their average, like a phosphor seeing the light the whole time
-/// the frame lasts: a sound moving fast leaves a continuous trail instead
-/// of a row of separate spots (one per frame), whatever the frame rate.
+/// audio with as many evenly spaced analyses as that needs, each handed to
+/// the phosphor in turn (`gfx::PhosphorFrame::steps`), like a phosphor lit
+/// the whole time the frame lasts: a sound moving fast leaves a smooth trail
+/// instead of a row of spots or ridges (one per frame), whatever the frame
+/// rate.
 const SUB_STEP: f64 = 0.004;
+
+/// Whether the glows of FFT size `res` are drawn at every analysis step
+/// (`SUB_STEP`), or once per frame: only short windows (21 ms at 48 kHz)
+/// change within a frame. The long ones are the large, overlapping low
+/// glows, which would multiply the drawing for no visible difference (their
+/// trails showed under 3 % ripple per frame).
+fn stepped(res: usize) -> bool {
+    RES[res].0 <= 2048
+}
 /// The most analyses for one frame (a stall or a seek is not drawn as motion).
 const MAX_SUB_STEPS: usize = 25;
 
@@ -171,10 +181,6 @@ pub struct Stereo {
     /// Hz per bin, per resolution.
     pub(super) bin_hz: Vec<f32>,
     last_frame: f64,
-    /// The bins' glows for the last frame (average over its analyses), and
-    /// the window size they were drawn for: kept while paused.
-    field: Batch,
-    field_size: (f32, f32),
     /// Brightness reference in use (0 = not yet set): provisional from what
     /// has played so far until the full analysis arrives, then blended to its
     /// value.
@@ -224,8 +230,6 @@ impl Stereo {
             bins: RES.iter().map(|&(n, _)| vec![Stats::default(); n / 2 + 1]).collect(),
             bin_hz,
             last_frame: f64::NAN,
-            field: Batch::default(),
-            field_size: (0.0, 0.0),
             reference: 0.0,
             provisional: 0.0,
             background: 0.0,
@@ -299,47 +303,42 @@ impl Stereo {
     #[allow(clippy::too_many_arguments)]
     /// `tl` is the full analysis once it has finished (`None` before).
     pub fn draw(&mut self, background: &mut Batch, track: &dyn Samples, rate: u32, frame: f64, dt: f32, tl: Option<&Timeline>, w: f32, h: f32) -> PhosphorFrame {
-        let (advance, bass) = self.step(track, rate, frame, dt, tl, w, h);
+        let (advance, bass, steps) = self.step(track, rate, frame, dt, tl, w, h);
         let mut live = Batch::default();
         let tonality = if params::get().bg_noise_white > 0.0 { self.bass_tonality() } else { 1.0 };
         draw_background(background, &mut live, bass.as_ref(), tonality, self.background, w, h);
-        live.append(&self.field);
-        PhosphorFrame { live, advance }
+        if advance.is_some() {
+            super::field::draw(self, &mut live, w, h, |r| !stepped(r));
+        }
+        PhosphorFrame { live, steps, advance }
     }
 }
 
 impl Stereo {
     /// Analyses the audio up to `frame` (unless paused there: then it
-    /// returns no advance), drawing the bins' glows into `self.field`, and
-    /// measures the background's bass.
+    /// returns no advance and no steps), drawing the glows of the `stepped`
+    /// FFT sizes at each analysis, and measures the background's bass.
     #[allow(clippy::too_many_arguments)]
-    fn step(&mut self, track: &dyn Samples, rate: u32, frame: f64, dt: f32, tl: Option<&Timeline>, w: f32, h: f32) -> (Option<f32>, Option<Bass>) {
+    fn step(&mut self, track: &dyn Samples, rate: u32, frame: f64, dt: f32, tl: Option<&Timeline>, w: f32, h: f32) -> (Option<f32>, Option<Bass>, Vec<Batch>) {
         let dt = dt.min(0.1);
         // Paused (same frame): nothing changes, and the phosphor holds still.
+        let mut steps = Vec::new();
         let advance = (frame != self.last_frame).then(|| {
             // The audio since the last analysis, in evenly spaced steps; after
             // a seek or a stall only `frame` itself.
             let gap = frame - self.last_frame;
             let n = (gap / (SUB_STEP * rate as f64)).ceil();
             let n = if n >= 1.0 && n <= MAX_SUB_STEPS as f64 { n as usize } else { 1 };
-            let mut field = Batch::default();
             for i in 1..=n {
                 let at = if n == 1 { frame } else { self.last_frame + gap * i as f64 / n as f64 };
                 self.update(track, at, dt / n as f32, tl.map(|t| t.stereo_ref));
-                super::field::draw(self, &mut field, w, h, 1.0 / n as f32);
+                let mut field = Batch::default();
+                super::field::draw(self, &mut field, w, h, stepped);
+                steps.push(field);
             }
-            self.field = field;
-            self.field_size = (w, h);
             self.last_frame = frame;
             dt
         });
-        if self.field_size != (w, h) {
-            // Resized while paused: redraw from the last analysis.
-            let mut field = Batch::default();
-            super::field::draw(self, &mut field, w, h, 1.0);
-            self.field = field;
-            self.field_size = (w, h);
-        }
         // The bass background: from the analysis (once it is there), or for
         // live input measured as it arrives. Both share the field's loudness
         // reference, so the bass lights the background as brightly as it
@@ -357,7 +356,7 @@ impl Stereo {
         if bass.is_some() {
             self.background = (self.background + dt / 0.6).min(1.0);
         }
-        (advance, bass)
+        (advance, bass, steps)
     }
 }
 
@@ -432,7 +431,7 @@ mod tests {
             st.update(&track, frame, 1.0 / 60.0, Some(tl.stereo_ref));
             let t1 = std::time::Instant::now();
             let mut out = Batch::default();
-            super::super::field::draw(&st, &mut out, w, h, 1.0);
+            super::super::field::draw(&st, &mut out, w, h, |_| true);
             glows += out.glows().len();
             grid += t1.elapsed();
             analysis += t1 - t0;
@@ -487,9 +486,137 @@ mod tests {
         println!("bin-frames {lit}: jumps > 0.5 {:.3}%, beyond the speakers {:.2}%", 100.0 * far as f64 / lit as f64, 100.0 * beyond as f64 / lit as f64);
     }
 
-    /// Renders the field for a song into PPM images, with the phosphor
-    /// simulated on the CPU (quarter resolution).
-    /// `MVIZ_FILE=song.mp3 MVIZ_OUT=dir cargo test --release dump_field -- --ignored`
+    /// The phosphor as on the GPU (`gfx`), on the CPU at half the window
+    /// size (RGB), for each analysis step:
+    /// glow' = blur(glow)·keep + max(previous live − live, 0).
+    struct Sim {
+        w: f32,
+        cw: usize,
+        ch: usize,
+        glow: Vec<[f32; 3]>,
+        prev: Vec<[f32; 3]>,
+        /// Live light shown for the last frame (the average over its steps).
+        live: Vec<[f32; 3]>,
+    }
+
+    impl Sim {
+        fn new(w: f32, h: f32) -> Self {
+            let (cw, ch) = ((w * 0.5) as usize, (h * 0.5) as usize);
+            let z = vec![[0.0; 3]; cw * ch];
+            Self { w, cw, ch, glow: z.clone(), prev: z.clone(), live: z }
+        }
+
+        /// Runs `f(x, y, pixel)` over `out`, in bands of rows on all cores.
+        fn each(cw: usize, out: &mut [[f32; 3]], f: impl Fn(usize, usize, &mut [f32; 3]) + Sync) {
+            let rows = (out.len() / cw).div_ceil(16);
+            std::thread::scope(|sc| {
+                for (j, chunk) in out.chunks_mut(rows * cw).enumerate() {
+                    let f = &f;
+                    sc.spawn(move || {
+                        for (i, v) in chunk.iter_mut().enumerate() {
+                            f(i % cw, j * rows + i / cw, v);
+                        }
+                    });
+                }
+            });
+        }
+
+        fn raster(&self, batch: &Batch) -> Vec<[f32; 3]> {
+            let s = self.cw as f32 / self.w;
+            let glows: Vec<_> = batch.glows().into_iter().map(|(cx, cy, rx, ry, c)| (cx * s, cy * s, (rx * s).max(0.5), (ry * s).max(0.5), c)).collect();
+            let mut out = vec![[0.0f32; 3]; self.cw * self.ch];
+            Self::each(self.cw, &mut out, |x, y, v| {
+                let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                for &(cx, cy, rx, ry, c) in &glows {
+                    let (dx, dy) = ((px - cx) / rx, (py - cy) / ry);
+                    let r2 = dx * dx + dy * dy;
+                    if r2 < 1.0 {
+                        let a = c[3] * (-r2 * 4.5).exp() * (1.0 - r2);
+                        for k in 0..3 {
+                            v[k] += c[k] * a;
+                        }
+                    }
+                }
+            });
+            out
+        }
+
+        /// The glow's spread: a cross of bilinear reads `o` pixels out.
+        fn blur(&mut self, o: f32) {
+            let (cw, ch) = (self.cw, self.ch);
+            let g = &self.glow;
+            let at = |x: f32, y: f32| -> [f32; 3] {
+                let (x, y) = ((x - 0.5).clamp(0.0, cw as f32 - 1.0), (y - 0.5).clamp(0.0, ch as f32 - 1.0));
+                let (x0, y0) = (x.floor() as usize, y.floor() as usize);
+                let (x1, y1) = ((x0 + 1).min(cw - 1), (y0 + 1).min(ch - 1));
+                let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+                std::array::from_fn(|k| {
+                    let a = g[y0 * cw + x0][k] * (1.0 - fx) + g[y0 * cw + x1][k] * fx;
+                    let b = g[y1 * cw + x0][k] * (1.0 - fx) + g[y1 * cw + x1][k] * fx;
+                    a * (1.0 - fy) + b * fy
+                })
+            };
+            let mut next = vec![[0.0f32; 3]; cw * ch];
+            Self::each(cw, &mut next, |x, y, v| {
+                let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                let (c, l, r, u, d) = (at(px, py), at(px - o, py), at(px + o, py), at(px, py - o), at(px, py + o));
+                *v = std::array::from_fn(|k| c[k] * 0.5 + (l[k] + r[k] + u[k] + d[k]) * 0.125);
+            });
+            self.glow = next;
+        }
+
+        /// One 60 fps frame of `st` at `frame`.
+        fn frame(&mut self, st: &mut Stereo, track: &dyn Samples, rate: u32, frame: f64, h: f32) {
+            let dt = 1.0f32 / 60.0;
+            let pf = st.draw(&mut Batch::default(), track, rate, frame, dt, None, self.w, h);
+            if pf.advance.is_none() {
+                return;
+            }
+            // Lit throughout the frame, plus each step's dots.
+            let slow = self.raster(&pf.live);
+            let steps = if pf.steps.is_empty() { vec![Batch::default()] } else { pf.steps };
+            let n = steps.len();
+            let p = params::get();
+            let keep = (-dt / n as f32 / p.fade).exp();
+            let o = crate::gfx::blur_offset(p.fade_blur, dt / n as f32);
+            let mut live = vec![[0.0f32; 3]; self.cw * self.ch];
+            for step in &steps {
+                let mut now = self.raster(step);
+                for (v, s) in now.iter_mut().zip(&slow) {
+                    for k in 0..3 {
+                        v[k] += s[k];
+                    }
+                }
+                self.blur(o);
+                for (((g, p), v), l) in self.glow.iter_mut().zip(&self.prev).zip(&now).zip(&mut live) {
+                    for k in 0..3 {
+                        g[k] = g[k] * keep + (p[k] - v[k]).max(0.0);
+                        l[k] += v[k] / n as f32;
+                    }
+                }
+                self.prev = now;
+            }
+            self.live = live;
+        }
+
+        fn shown(&self) -> Vec<[f32; 3]> {
+            self.live.iter().zip(&self.glow).map(|(l, g)| std::array::from_fn(|k| l[k] + g[k])).collect()
+        }
+
+        fn save(&self, path: &str) {
+            let mut ppm = format!("P6 {} {} 255\n", self.cw, self.ch).into_bytes();
+            for c in self.shown() {
+                ppm.extend(c.iter().map(|v| (v.clamp(0.0, 1.0) * 255.0) as u8));
+            }
+            std::fs::write(path, ppm).unwrap();
+        }
+    }
+
+    /// Renders the field for a song into PPM images (phosphor simulated on
+    /// the CPU), every `MVIZ_EVERY` of `MVIZ_FRAMES` frames from `MVIZ_START`
+    /// s, and prints the mean light (sum of channels) of the live light and
+    /// the glow after the first second.
+    /// `MVIZ_FILE=song.mp3 MVIZ_OUT=dir cargo test --release dump_field -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn dump_field() {
@@ -497,51 +624,123 @@ mod tests {
         let out = std::env::var("MVIZ_OUT").expect("set MVIZ_OUT");
         let track = crate::audio::load(std::path::Path::new(&path)).unwrap();
         let rate = track.rate;
-        let tl = crate::analysis::analyze(&track, &Default::default());
+        let var = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        let (start, every, frames) = (var("MVIZ_START", 40.0), var("MVIZ_EVERY", 60.0) as usize, var("MVIZ_FRAMES", 300.0) as usize);
+        let (w, h) = (1600.0, 1000.0);
         let mut st = Stereo::new(rate);
-        let (w, h) = (2472.0, 779.0);
-        let (cw, ch) = (618usize, 195usize); // canvas: a quarter of the window
-        let start: f64 = std::env::var("MVIZ_START").ok().and_then(|v| v.parse().ok()).unwrap_or(40.0);
-        let every: usize = std::env::var("MVIZ_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(100);
-        let frames: usize = std::env::var("MVIZ_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(400);
-        // CPU copy of the phosphor: glow = glow·keep + max(previous − now, 0); shown = now + glow.
-        let keep = (-1.0f32 / 60.0 / params::get().fade).exp();
-        let mut prev = vec![0.0f32; cw * ch * 3];
-        let mut glow = vec![0.0f32; cw * ch * 3];
+        let mut sim = Sim::new(w, h);
+        let (mut live, mut glow) = (0.0f64, 0.0f64);
+        let mean = |v: &[[f32; 3]]| v.iter().map(|c| (c[0] + c[1] + c[2]) as f64).sum::<f64>() / v.len() as f64;
         for i in 0..frames {
-            st.step(&track, rate, (start + i as f64 / 60.0) * rate as f64, 1.0 / 60.0, Some(&tl), w, h);
-            let batch = &st.field;
-            let mut now = vec![0.0f32; cw * ch * 3];
-            let s = cw as f32 / w;
-            for (cx, cy, rx, ry, c) in batch.glows() {
-                let (cx, cy, rx, ry) = (cx * s, cy * s, (rx * s).max(0.5), (ry * s).max(0.5));
-                let (x0, x1) = (((cx - rx).floor().max(0.0)) as usize, ((cx + rx).ceil() as usize).min(cw));
-                let (y0, y1) = (((cy - ry).floor().max(0.0)) as usize, ((cy + ry).ceil() as usize).min(ch));
-                for y in y0..y1 {
-                    for x in x0..x1 {
-                        let (dx, dy) = ((x as f32 + 0.5 - cx) / rx, (y as f32 + 0.5 - cy) / ry);
-                        let r2 = dx * dx + dy * dy;
-                        if r2 < 1.0 {
-                            let a = c[3] * (-r2 * 4.5).exp() * (1.0 - r2);
-                            for k in 0..3 {
-                                now[(y * cw + x) * 3 + k] += c[k] * a;
-                            }
-                        }
-                    }
-                }
+            sim.frame(&mut st, &track, rate, (start + i as f64 / 60.0) * rate as f64, h);
+            if i >= 60 {
+                live += mean(&sim.live);
+                glow += mean(&sim.glow);
             }
-            for j in 0..now.len() {
-                glow[j] = glow[j] * keep + (prev[j] - now[j]).max(0.0);
-            }
-            prev = now;
             if i % every == every - 1 {
-                let mut ppm = format!("P6 {cw} {ch} 255\n").into_bytes();
-                for j in 0..prev.len() {
-                    ppm.push(((prev[j] + glow[j]).clamp(0.0, 1.0) * 255.0) as u8);
-                }
-                std::fs::write(format!("{out}/field_{i}.ppm"), ppm).unwrap();
+                sim.save(&format!("{out}/field_{i}.ppm"));
             }
         }
+        let k = frames.saturating_sub(60).max(1) as f64;
+        println!("from {start} s: mean live {:.5}, glow {:.5}", live / k, glow / k);
+    }
+
+    /// Lightness ripple along the trail of a tone panned across the field
+    /// at constant speed: the strongest ripple's period and size (peak to
+    /// peak, against the smoothed lightness), next to how far the tone moves
+    /// per analysis step and per frame. Was up to 20 % with a period of one
+    /// frame's travel when the phosphor took light once per frame.
+    /// `cargo test --release trail_ripple -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn trail_ripple() {
+        use std::f32::consts::{FRAC_PI_2, TAU};
+        let rate = 48000u32;
+        let (w, h) = (1600.0f32, 1000.0f32);
+        println!("{:>6} {:>6} | {:>7} {:>7} | {:>6} {:>6}", "Hz", "sweep", "d_step", "d_frame", "period", "ripple");
+        for &f in &[1000.0f32, 2000.0, 4000.0, 8000.0] {
+            for &sweep in &[2.0f32, 1.0, 0.5] {
+                // Pan from left to right over `sweep` seconds, after a still second.
+                let n = (rate as f32 * (1.0 + sweep)) as usize;
+                let samples: Vec<f32> = (0..n)
+                    .flat_map(|i| {
+                        let t = i as f32 / rate as f32;
+                        let u = ((t - 1.0) / sweep).clamp(0.0, 1.0);
+                        let th = 0.05 + u * (FRAC_PI_2 - 0.1);
+                        let v = (TAU * f * t).sin() * 0.3;
+                        [v * th.cos(), v * th.sin()]
+                    })
+                    .collect();
+                let track = crate::audio::Track::from_interleaved(&samples, rate);
+                let frames = ((1.0 + sweep * 0.66) * 60.0) as usize;
+                let mut st = Stereo::new(rate);
+                let mut sim = Sim::new(w, h);
+                // The dot: the brightest point of the live light, each frame.
+                let mut dots = Vec::new();
+                for i in 0..frames {
+                    sim.frame(&mut st, &*track, rate, i as f64 / 60.0 * rate as f64, h);
+                    let lum: Vec<f32> = sim.live.iter().map(|c| c[0] + c[1] + c[2]).collect();
+                    let m = (0..lum.len()).max_by(|a, b| lum[*a].total_cmp(&lum[*b])).unwrap();
+                    dots.push((m % sim.cw, m / sim.cw));
+                }
+                let k = dots.len();
+                let d_frame = (dots[k - 1].0 as f32 - dots[k - 11].0 as f32) / 10.0;
+                let d_step = d_frame / ((rate as f64 / 60.0) / (SUB_STEP * rate as f64)).ceil() as f32;
+                let (dot, row) = dots[k - 1];
+                let lum: Vec<f32> = sim.shown().iter().map(|c| c[0] + c[1] + c[2]).collect();
+                // Past the dot's own light (where the live light is under 2 % of
+                // its peak), up to 12 frames back.
+                let peak = sim.live[row * sim.cw + dot].iter().sum::<f32>();
+                let mut b = dot;
+                while b > 0 && sim.live[row * sim.cw + b].iter().sum::<f32>() > 0.02 * peak {
+                    b -= 1;
+                }
+                let a = (b as f32 - 12.0 * d_frame).max(0.0) as usize;
+                let (period, size) = ripple(&lum[row * sim.cw..(row + 1) * sim.cw], a, b, d_frame);
+                println!("{f:>6} {sweep:>5}s | {d_step:>6.1}p {d_frame:>6.1}p | {period:>5.1}p {:>5.1}%", size * 100.0);
+            }
+        }
+    }
+
+    /// The strongest periodic ripple of `line[a..b]` relative to its smoothed
+    /// self (over two frames' travel): (period in px, peak to peak).
+    fn ripple(line: &[f32], a: usize, b: usize, d_frame: f32) -> (f32, f32) {
+        use std::f32::consts::TAU;
+        if b <= a + 8 {
+            return (0.0, 0.0);
+        }
+        let prof = &line[a..b];
+        let sig = (2.0 * d_frame).max(3.0);
+        let k = (3.0 * sig) as i32;
+        let res: Vec<f32> = (0..prof.len() as i32)
+            .map(|i| {
+                let (mut s, mut wsum) = (0.0, 0.0);
+                for j in -k..=k {
+                    let q = (i + j).clamp(0, prof.len() as i32 - 1) as usize;
+                    let wj = (-(j * j) as f32 / (2.0 * sig * sig)).exp();
+                    s += prof[q] * wj;
+                    wsum += wj;
+                }
+                let smooth = s / wsum;
+                if smooth > 1e-6 { prof[i as usize] / smooth - 1.0 } else { 0.0 }
+            })
+            .collect();
+        let (mut best_p, mut best_a) = (0.0, 0.0);
+        let mut period = 2.0f32;
+        while period < sig * 2.0 {
+            let (mut re, mut im) = (0.0, 0.0);
+            for (x, r) in res.iter().enumerate() {
+                let ph = TAU * x as f32 / period;
+                re += r * ph.cos();
+                im += r * ph.sin();
+            }
+            let amp = 2.0 * (re * re + im * im).sqrt() / res.len() as f32;
+            if amp > best_a {
+                (best_p, best_a) = (period, amp);
+            }
+            period *= 1.02;
+        }
+        (best_p, 2.0 * best_a)
     }
 
     #[test]
@@ -593,3 +792,4 @@ mod tests {
         println!("same note {same} of {notes} frames ({:.0}%), mean level difference {:.3}", 100.0 * same as f32 / notes.max(1) as f32, level_err / n.max(1) as f32);
     }
 }
+
