@@ -4,6 +4,7 @@
 pub mod field;
 pub mod live_bass;
 pub mod stereo;
+mod tracks;
 
 use crate::analysis::Timeline;
 use crate::dsp::{colour, BACKGROUND_SATURATION};

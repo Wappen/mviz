@@ -14,6 +14,7 @@
 //! a phosphor texture on the GPU (see `gfx::FADE`).
 
 use super::live_bass::LiveBass;
+use super::tracks::Tracks;
 use super::{draw_background, Bass};
 use crate::analysis::Timeline;
 use crate::audio::Samples;
@@ -163,19 +164,25 @@ impl Stats {
     /// One analysis of the bin. `fading`: how far its band's sound has
     /// fallen below its average (`Stats::fading`), 0 = not at all.
     fn add(&mut self, p: &params::Params, dt: f32, fading: f32, l: Complex32, r: Complex32) {
-        let (l2, r2, x) = (l.norm_sqr(), r.norm_sqr(), l * r.conj());
         let fast = (1.0 - fading) / p.smooth.max(1e-3) + fading / p.forget.max(1e-3).min(p.smooth.max(1e-3));
         let f = 1.0 - (-dt * fast).exp();
         // Only the level balance forgets: polarity and timing need their
         // long average to tell a real phase from noise, whatever is playing
         // (forgetting them too lets bins flicker out of phase).
         let s = 1.0 - (-dt / p.slow.max(1e-3)).exp();
-        self.l2 += (l2 - self.l2) * f;
-        self.r2 += (r2 - self.r2) * f;
-        self.cross += (x - self.cross) * f;
-        self.slow_l2 += (l2 - self.slow_l2) * s;
-        self.slow_r2 += (r2 - self.slow_r2) * s;
-        self.slow_cross += (x - self.slow_cross) * s;
+        self.learn(l, r, f, s);
+    }
+
+    /// Moves the averages towards one analysis `l`, `r` by `fast` (level
+    /// balance) and `slow` (polarity and timing), each 0 .. 1.
+    pub fn learn(&mut self, l: Complex32, r: Complex32, fast: f32, slow: f32) {
+        let (l2, r2, x) = (l.norm_sqr(), r.norm_sqr(), l * r.conj());
+        self.l2 += (l2 - self.l2) * fast;
+        self.r2 += (r2 - self.r2) * fast;
+        self.cross += (x - self.cross) * fast;
+        self.slow_l2 += (l2 - self.slow_l2) * slow;
+        self.slow_r2 += (r2 - self.slow_r2) * slow;
+        self.slow_cross += (x - self.slow_cross) * slow;
     }
 
     /// How far a band's sound has fallen below its average, from its power
@@ -206,6 +213,10 @@ pub struct Stereo {
     pub(super) live: Vec<Live>,
     /// Per resolution, per FFT bin: smoothed stats (placement).
     pub(super) bins: Vec<Vec<Stats>>,
+    /// Per resolution: the partial tracks (placing the bins around them),
+    /// and the range of bins they are looked for in.
+    pub(super) tracks: Vec<Tracks>,
+    track_range: Vec<(usize, usize)>,
     /// Hz per bin, per resolution.
     pub(super) bin_hz: Vec<f32>,
     last_frame: f64,
@@ -256,6 +267,14 @@ impl Stereo {
             ffts,
             live: vec![Live::default(); nb],
             bins: RES.iter().map(|&(n, _)| vec![Stats::default(); n / 2 + 1]).collect(),
+            tracks: RES.iter().map(|_| Tracks::default()).collect(),
+            track_range: (0..RES.len())
+                .map(|res| {
+                    let ks = bands.iter().flat_map(|b| &b.parts).filter(|p| p.res == res);
+                    let k0 = ks.clone().map(|p| p.k0).min().unwrap_or(0);
+                    (k0, ks.map(|p| p.k1).max().unwrap_or(0))
+                })
+                .collect(),
             bin_hz,
             last_frame: f64::NAN,
             reference: 0.0,
@@ -299,6 +318,13 @@ impl Stereo {
                 }
             }
             g.energy = energy;
+        }
+        if p.tracks {
+            for (res, tracks) in self.tracks.iter_mut().enumerate() {
+                let [sl, sr] = &self.spec[res];
+                let (k0, k1) = self.track_range[res];
+                tracks.update(&p, dt, sl, sr, &self.bins[res], k0, k1);
+            }
         }
 
         // Brightness reference. The full analysis measures it over the whole

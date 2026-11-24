@@ -100,7 +100,8 @@ pub fn draw(st: &Stereo, out: &mut Batch, w: f32, h: f32, which: impl Fn(usize) 
                     continue;
                 }
                 let f = k as f32 * hz;
-                let stats = &st.bins[part.res][k];
+                // Near a partial track: placed by the track (see `tracks`).
+                let stats = st.tracks[part.res].placing(k).unwrap_or(&st.bins[part.res][k]);
                 let pos = position(&p, stats, f);
 
                 let (mut rx, mut ry) = spot_size(&p, f, w, h);

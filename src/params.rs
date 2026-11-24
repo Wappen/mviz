@@ -93,6 +93,23 @@ pub struct Params {
     pub forget: f32,
     pub fade_lo: f32,
     pub fade_hi: f32,
+    /// Partial tracks (see `modes::tracks`): whether bins near one are
+    /// placed by it.
+    pub tracks: bool,
+    /// How far (dB) a peak must stand above its surroundings to be followed.
+    pub peak_db: f32,
+    /// How far (dB) it must stand out for its track to learn its direction
+    /// from it: not at all at `glimpse_lo_db`, fully at `glimpse_hi_db`.
+    pub glimpse_lo_db: f32,
+    pub glimpse_hi_db: f32,
+    /// How far (bins) a track's peak may move from one analysis to the next.
+    pub track_move: f32,
+    /// How long (s) a track must be followed before it places bins, and how
+    /// long it keeps them while its peak is missing (covered, say, by a hit).
+    pub track_birth: f32,
+    pub track_hold: f32,
+    /// Averaging time (s) of a track's level balance, over its glimpses.
+    pub track_smooth: f32,
     /// Arrival-time difference mapped to hard left/right (ms).
     pub max_delay_ms: f32,
     /// Timing used fully below / not at all above (Hz).
@@ -158,6 +175,14 @@ impl Params {
         forget: 0.015,
         fade_lo: 1.3,
         fade_hi: 3.0,
+        tracks: true,
+        peak_db: 10.0,
+        glimpse_lo_db: 10.0,
+        glimpse_hi_db: 20.0,
+        track_move: 1.0,
+        track_birth: 0.012,
+        track_hold: 0.1,
+        track_smooth: 0.1,
         max_delay_ms: 0.7,
         delay_fade_lo: 500.0,
         delay_fade_hi: 700.0,
